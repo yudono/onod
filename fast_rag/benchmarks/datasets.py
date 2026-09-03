@@ -30,10 +30,22 @@ from __future__ import annotations
 import os
 from typing import List, Dict, Any, Tuple
 
+def _resolve_corpus(path=None):
+    """Dinamis: cari korpus di files/ dulu (repo layout baru), lalu root/absolut."""
+    if path is None:
+        path = "ANTAM FS 30 Juni 2026.pdf"
+    from pathlib import Path as _P
+    name = _P(path).name
+    for cand in [_P("files") / name, _P("files") / path, _P(path)]:
+        if cand.exists():
+            return str(cand)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Corpus info (§26 staged target is ANTAM FS 30 Juni 2026.pdf)
 # ---------------------------------------------------------------------------
-CORPUS_PATH = "ANTAM FS 30 Juni 2026.pdf"
+CORPUS_PATH = _resolve_corpus("ANTAM FS 30 Juni 2026.pdf")
 # Verified via parse_pdf: 178 pages, ~616k chars, file 1.66 MB
 CORPUS_STATS = {
     "path": CORPUS_PATH,

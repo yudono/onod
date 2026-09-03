@@ -58,6 +58,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+def _resolve_corpus(path=None):
+    """Dinamis: cari korpus di files/ dulu (repo layout baru), lalu root/absolut."""
+    if path is None:
+        path = "ANTAM FS 30 Juni 2026.pdf"
+    from pathlib import Path as _P
+    name = _P(path).name
+    for cand in [_P("files") / name, _P("files") / path, _P(path)]:
+        if cand.exists():
+            return str(cand)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Optional deps — all graceful fallbacks
 # ---------------------------------------------------------------------------
@@ -122,7 +134,7 @@ try:
     )
 except Exception:
     # fallback if datasets.py missing (should not happen)
-    DATASET_CORPUS_PATH = "ANTAM FS 30 Juni 2026.pdf"
+    DATASET_CORPUS_PATH = _resolve_corpus("ANTAM FS 30 Juni 2026.pdf")
     GROUND_TRUTH_QUERIES = []
     TRANSLATION_MAP = {}
     SPLADE_EXPANSION = {}
@@ -538,8 +550,7 @@ class Benchmark:
             for alt in [
                 os.path.join(os.path.dirname(__file__), "..", "..", self.corpus_path),
                 os.path.join(os.getcwd(), self.corpus_path),
-                "ANTAM FS 30 Juni 2026.pdf",
-                "/Users/yudonoputro/Documents/projects/onod/ANTAM FS 30 Juni 2026.pdf",
+                _resolve_corpus("ANTAM FS 30 Juni 2026.pdf"),
             ]:
                 alt = os.path.normpath(alt)
                 if os.path.exists(alt):

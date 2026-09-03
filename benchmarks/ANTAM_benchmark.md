@@ -1,29 +1,29 @@
 # ANTAM Benchmark — PRD §25-26
 
-Corpus: `ANTAM FS 30 Juni 2026.pdf` — 178 pages, 616689 chars, 1.584 MB (ANTAM FS 30 Juni 2026.pdf)
+Corpus: `files/ANTAM FS 30 Juni 2026.pdf` — 178 pages, 616689 chars, 1.584 MB (ANTAM FS 30 Juni 2026.pdf)
 Queries: 5 ground-truth (revenue, direksi, commodities, proyeksi, net profit margin) — binary keyword relevance
 Metrics: Recall@10/50/100, MRR, nDCG@10, indexing time, query latency p50/p95, RAM, disk (PRD §25)
-Date: 2026-09-03 19:53:21
+Date: 2026-09-03 21:14:09
 
 ## Baseline Comparison (PRD §25)
 
 | Baseline | Recall@10 | Recall@50 | Recall@100 | MRR | nDCG@10 | nDCG@100 | Indexing (s) | p50 (ms) | p95 (ms) | RAM (MB) | Disk (MB) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| BM25 | 1.000 | 1.000 | 1.000 | 0.700 | 0.576 | 0.404 | 0.51 | 3.1 | 10.7 | 203.9 | 2.280 |
-| BM25+translation | 1.000 | 1.000 | 1.000 | 0.900 | 0.804 | 0.444 | 0.45 | 1.4 | 2.3 | 210.0 | 2.280 |
-| Multilingual Dense | 0.800 | 1.000 | 1.000 | 0.369 | 0.199 | 0.259 | 17.35 | 123.9 | 159.0 | 823.4 | 0.594 |
-| SPLADE | 1.000 | 1.000 | 1.000 | 1.000 | 0.788 | 0.465 | 7.11 | 1.8 | 2.5 | 1102.6 | 2.363 |
-| Semantic-code | 0.400 | 0.400 | 0.400 | 0.240 | 0.061 | 0.043 | 6.07 | 23.8 | 25.1 | 1109.4 | 2.362 |
-| Semantic+BM25 | 1.000 | 1.000 | 1.000 | 0.800 | 0.592 | 0.408 | 5.28 | 26.0 | 37.1 | 1037.1 | 2.362 |
-| Semantic+BM25+Reranker | 1.000 | 1.000 | 1.000 | 0.633 | 0.536 | 0.400 | 13.25 | 1334.3 | 1562.7 | 995.0 | 2.362 |
+| BM25 | 1.000 | 1.000 | 1.000 | 0.800 | 0.606 | 0.408 | 0.16 | 0.7 | 1.0 | 202.7 | 2.287 |
+| BM25+translation | 1.000 | 1.000 | 1.000 | 0.900 | 0.817 | 0.444 | 0.19 | 0.7 | 1.0 | 207.3 | 2.287 |
+| Multilingual Dense | 0.800 | 1.000 | 1.000 | 0.369 | 0.199 | 0.259 | 14.70 | 55.1 | 65.9 | 594.4 | 0.594 |
+| SPLADE | 1.000 | 1.000 | 1.000 | 1.000 | 0.801 | 0.465 | 4.14 | 0.9 | 1.4 | 479.8 | 2.370 |
+| Semantic-code | 0.400 | 0.400 | 0.400 | 0.240 | 0.061 | 0.043 | 3.60 | 17.3 | 19.4 | 489.3 | 2.368 |
+| Semantic+BM25 | 1.000 | 1.000 | 1.000 | 0.900 | 0.622 | 0.411 | 3.76 | 18.6 | 19.3 | 418.6 | 2.368 |
+| Semantic+BM25+Reranker | 1.000 | 1.000 | 1.000 | 0.667 | 0.554 | 0.401 | 12.02 | 844.0 | 1224.9 | 421.3 | 2.368 |
 
 ### Lexical vs Hybrid vs Hybrid+Reranker (focus per task)
 
 | Config | Recall@10 | MRR | nDCG@10 | p50 (ms) | Indexing (s) |
 |---|---|---|---|---|---|
-| BM25 | 1.000 | 0.700 | 0.576 | 3.1 | 0.51 |
-| Semantic+BM25 | 1.000 | 0.800 | 0.592 | 26.0 | 5.28 |
-| Semantic+BM25+Reranker | 1.000 | 0.633 | 0.536 | 1334.3 | 13.25 |
+| BM25 | 1.000 | 0.800 | 0.606 | 0.7 | 0.16 |
+| Semantic+BM25 | 1.000 | 0.900 | 0.622 | 18.6 | 3.76 |
+| Semantic+BM25+Reranker | 1.000 | 0.667 | 0.554 | 844.0 | 12.02 |
 
 **Notes:**
 - Load corpus via `parse_pdf` / `FastRAGEngine.index_pdf` (178 pages, 616k chars) exactly as `test_rag.py`; hybrid baselines correspond to `FastRAGEngine(use_reranker=False)` (α=0.25 β=0.55) and `FastRAGEngine(use_reranker=True)` for reranker (§25).
@@ -36,10 +36,10 @@ Date: 2026-09-03 19:53:21
 
 | Stage | Corpus | Proj. Indexing (s) | Proj. p50 (ms) | <60s | <100ms | Languages |
 |---|---|---|---|---|---|---|
-| 1 MB | 1 MB | 3.33 | 26.0 | ✅ | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
-| 10 MB | 10 MB | 28.34 | 32.2 | ✅ | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
-| 100 MB | 100 MB | 283.4 | 40.0 | ❌ (needs Rust+mmap+parallel, PRD §18-19) | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
-| 1024 MB | 1024 MB | 2902.01 | 47.9 | ❌ (needs Rust+mmap+parallel, PRD §18-19) | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
+| 1 MB | 1 MB | 2.38 | 18.6 | ✅ | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
+| 10 MB | 10 MB | 20.2 | 23.1 | ✅ | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
+| 100 MB | 100 MB | 202.04 | 28.7 | ❌ (needs Rust+mmap+parallel, PRD §18-19) | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
+| 1024 MB | 1024 MB | 2068.85 | 34.4 | ❌ (needs Rust+mmap+parallel, PRD §18-19) | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
 
 - Stage 1 (1.6MB this benchmark) measured; larger stages extrapolated linear indexing + log query (WAND). True 1GB requires Rust+mmap+parallel (§18-19) to meet PRD §1 targets.
 - Languages 5→20→100+ quality expected to hold via multilingual teacher alignment (§3) — to be validated on MIRACL/MrTyDi/MKQA (PRD §25).

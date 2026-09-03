@@ -33,8 +33,18 @@ def hallucination_check(answer, doc_numbers):
     hallu = [n for n in nums if n not in doc_set]
     return hallu, nums
 
-# Extract doc numbers for hallucination ground truth (from known doc)
-DOC_NUMBERS = ["62.714.280","59.019.725","51.863.249","50.782.060","10.851.031","8.237.665","1.477.783","1.276.183","930.042","823.879","8.443.206","6.137.603","198.142","239.548","346.646","1.577.780","3.498.228","24.030.764.725","6.518.295"]
+# Ground-truth angka dinamis: extract SEMUA angka langsung dari dokumen asli (bukan hard-coded list)
+# Summarizer extractive hanya copy verbatim, jadi angka di jawaban valid <=> angka ada di dokumen
+def _extract_doc_numbers(pdf_path):
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
+    doc = fitz.open(pdf_path)
+    full = " ".join(p.get_text() for p in doc)
+    return set(re.findall(r"\d{1,3}(?:\.\d{3})+", full)), full
+
+DOC_NUMBERS, _DOC_FULLTEXT = _extract_doc_numbers(PDF_PATH)
 
 TESTS = [
     {
