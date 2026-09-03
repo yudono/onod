@@ -1,0 +1,11 @@
+cache/
+tmp/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.DS_Store
+*.npz
+*.bin
+files/*.pdf
