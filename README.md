@@ -10,11 +10,11 @@ Full Rust search engine untuk dokumen multibahasa. Tokenisasi, chunking, BM25, t
 
 | Query | Expected | Result | Latency |
 |---|---|---|---|
-| What is the total revenue? | revenue, pendapatan | OK | 2.0ms |
-| Siapa saja direksi? | direksi, director | OK | 3.1ms |
-| Berapa laba bruto? | laba, profit | OK | 3.0ms |
-| What are the main commodities? | gold, nickel | OK | 2.9ms |
-| Net profit margin? | profit, margin | OK | 1.7ms |
+| What is the total revenue? | revenue, pendapatan | OK | 0.7ms |
+| Siapa saja direksi? | direksi, director | OK | 0.5ms |
+| Berapa laba bruto? | laba, profit | OK | 0.5ms |
+| What are the main commodities? | gold, nickel | OK | 0.8ms |
+| Net profit margin? | profit, margin | OK | 0.5ms |
 
 **Recall: 5/5 = 100%**
 
@@ -22,16 +22,17 @@ Full Rust search engine untuk dokumen multibahasa. Tokenisasi, chunking, BM25, t
 
 | Metric | Value | Target |
 |---|---|---|
-| Avg query latency | **0.7ms** | <100ms |
-| p50 query latency | **0.7ms** | <100ms |
+| Avg query latency | **0.6ms** | <100ms |
+| p50 query latency | **0.5ms** | <100ms |
 | Max query latency | **0.8ms** | <100ms |
-| Index time (Rust only) | **~1.6s** | <5s |
-| Index time (total) | **1.65s** | <60s |
-| Total chunks | 3847 | — |
+| Index time (Rust only) | **~2.4s** | <5s |
+| Index time (total) | **2.46s** | <60s |
+| Total chunks | 3750 | — |
 | Word terms | ~7000 | — |
 | Trigram terms | ~35000 | — |
 | Index size (binary) | 16MB | — |
 | Load time (binary) | 0.03s | — |
+| PDF parser | pdf_oxide (Rust-native) | — |
 | mmap support | >100MB files | — |
 | SIMD BM25 | 8 docs/batch | — |
 
@@ -39,10 +40,10 @@ Full Rust search engine untuk dokumen multibahasa. Tokenisasi, chunking, BM25, t
 
 | Corpus | Chunks | Index Time | Query p50 |
 |---|---|---|---|
-| ANTAM (1.6 MB) | 2002 | 3.2s | 1.8ms |
-| Adaro (2.7 MB) | 1612 | 2.8s | 2.1ms |
-| 10840 (25 MB) | 233 | 0.4s | 1.5ms |
-| Combined (4.3 MB) | 3847 | 4.0s | 2.5ms |
+| ANTAM (1.6 MB) | 1909 | 1.2s | 0.5ms |
+| Adaro (2.7 MB) | 1612 | 1.0s | 0.6ms |
+| 10840 (25 MB) | 229 | 0.3s | 0.5ms |
+| Combined (4.3 MB) | 3750 | 2.5s | 0.6ms |
 
 ### Comparison
 
@@ -70,14 +71,6 @@ cargo build --release
 # Binary ada di:
 # core/target/release/onod
 ```
-
-### Python (opsional, untuk PDF parsing)
-
-```bash
-pip install pymupdf
-```
-
-Tanpa pymupdf, hanya bisa index file teks (TXT, MD, CSV, JSON, HTML).
 
 ---
 
@@ -129,7 +122,7 @@ Avg latency: 2.2ms
   Dokumen (PDF/TXT/MD/CSV/HTML)
          │
          ▼
-  PDF Parser (pymupdf subprocess)
+  PDF Parser (pdf_oxide, Rust-native)
          │
          ▼
   Chunking: 600 char, 140 overlap, kalimat-aware
