@@ -534,7 +534,7 @@ impl OnodIndex {
         for (rank,(doc,_)) in wr.iter().enumerate(){*acc.entry(*doc).or_insert(0.0)+=W_WORD/(RRF_K+rank as f64+1.0);}
         for (rank,(doc,_)) in tr.iter().enumerate(){*acc.entry(*doc).or_insert(0.0)+=W_TRI/(RRF_K+rank as f64+1.0);}
 
-        let qnums: HashSet<&str> = lex.iter().filter(|t|is_thousands(t)).map(|s|s.as_str()).collect();
+        let qnums: HashSet<&str> = all_lex.iter().filter(|t|is_thousands(t)).map(|s|s.as_str()).collect();
         let mut fused: Vec<(u32,f64)> = acc.into_iter().collect();
         if !qnums.is_empty(){
             for(doc,s) in fused.iter_mut(){
