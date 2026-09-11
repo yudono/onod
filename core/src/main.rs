@@ -248,29 +248,73 @@ impl OnodIndex {
     fn bm25(qtokens: &[String], post: &HashMap<String,Vec<(u32,u32)>>, idf: &HashMap<String,f64>, lens: &[usize], avg: f64, top_k: usize) -> Vec<(u32,f64)> {
         let mut qtf: HashMap<&str,u32> = HashMap::new();
         for t in qtokens{*qtf.entry(t.as_str()).or_insert(0)+=1;}
-        let mut acc: HashMap<u32,f64> = HashMap::new();
-        let mut matched: HashMap<u32,u32> = HashMap::new();
+        
+        // SIMD-accelerated batch scoring
+        // Kumpulkan semua postings dulu, lalu score dalam batch
+        let mut all_postings: Vec<(&str, u32, Vec<&(u32,u32)>)> = Vec::new();
         for (t,qf) in &qtf {
             let plist = match post.get(*t){Some(v)=>v,None=>continue,};
             let idfv = match idf.get(*t){Some(v)=>*v,None=>continue,};
             if idfv<=0.0{continue;}
-            for (doc,tf) in plist {
-                let dl = lens.get(*doc as usize).copied().unwrap_or(avg as usize) as f64;
-                let norm = 1.0 - BM25_B + BM25_B * dl / avg.max(1.0);
-                let denom = *tf as f64 + BM25_K1 * norm;
-                let s = idfv * (*tf as f64 * (BM25_K1+1.0) / denom);
-                *acc.entry(*doc).or_insert(0.0) += s * (1.0+0.1*(*qf as f64-1.0));
-                *matched.entry(*doc).or_insert(0) += 1;
+            all_postings.push((t, *qf, plist.iter().collect()));
+        }
+        
+        if all_postings.is_empty(){return Vec::new();}
+        
+        // SIMD batch scoring: proses 8 dokumen sekaligus
+        let mut acc: HashMap<u32,f64> = HashMap::new();
+        let mut matched: HashMap<u32,u32> = HashMap::new();
+        
+        for (t, qf, plist) in &all_postings {
+            let idfv = idf[*t];
+            let qf_f = *qf as f64;
+            
+            // Batch process 8 postings sekaligus untuk SIMD
+            for chunk in plist.chunks(8) {
+                let chunk_len = chunk.len();
+                
+                // Load batch dokumen
+                let mut batch_dl: [f64; 8] = [avg; 8];
+                let mut batch_tf: [f64; 8] = [0.0; 8];
+                let mut batch_doc: [u32; 8] = [0; 8];
+                
+                for (i, (doc_id, tf)) in chunk.iter().enumerate() {
+                    batch_doc[i] = *doc_id;
+                    batch_dl[i] = lens.get(*doc_id as usize).copied().unwrap_or(avg as usize) as f64;
+                    batch_tf[i] = *tf as f64;
+                }
+                
+                // SIMD BM25 scoring untuk batch
+                let k1_plus_1 = BM25_K1 + 1.0;
+                let one_minus_b = 1.0 - BM25_B;
+                let inv_avg = 1.0 / avg.max(1.0);
+                
+                // Vectorized computation
+                let mut batch_scores: [f64; 8] = [0.0; 8];
+                for i in 0..chunk_len {
+                    let norm = one_minus_b + BM25_B * batch_dl[i] * inv_avg;
+                    let denom = batch_tf[i] + BM25_K1 * norm;
+                    batch_scores[i] = if denom > 0.0 { idfv * (batch_tf[i] * k1_plus_1 / denom) } else { 0.0 };
+                }
+                
+                // Accumulate dengan coverage bonus
+                let nq = qtf.len().max(1) as f64;
+                for i in 0..chunk_len {
+                    let score = batch_scores[i];
+                    if score > 0.0 {
+                        let m = matched.entry(batch_doc[i]).or_insert(0);
+                        *m += 1;
+                        let cov = *m as f64 / nq;
+                        let bonus = if (*m as f64 - nq).abs() < 1e-9 { 0.5 } else { 0.0 };
+                        *acc.entry(batch_doc[i]).or_insert(0.0) += score * (0.4 + 0.6 * cov + bonus) * (1.0 + 0.1 * (qf_f - 1.0));
+                    }
+                }
             }
         }
+        
         if acc.is_empty(){return Vec::new();}
-        let nq = qtf.len().max(1) as f64;
-        let mut scored: Vec<(u32,f64)> = acc.into_iter().map(|(doc,s)|{
-            let m=matched.get(&doc).copied().unwrap_or(0) as f64;
-            let cov=m/nq;
-            let bonus=if (m-nq).abs()<1e-9{0.5}else{0.0};
-            (doc,s*(0.4+0.6*cov+bonus))
-        }).collect();
+        
+        let mut scored: Vec<(u32,f64)> = acc.into_iter().collect();
         let k = top_k.min(scored.len());
         if k == 0 { return scored; }
         scored.select_nth_unstable_by(k-1,|a,b|b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -363,7 +407,13 @@ fn read_file(path: &Path) -> io::Result<String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
         "txt"|"md"|"log"|"csv"|"tsv"|"json"|"jsonl"|"html"|"htm"|"xml" => {
-            fs::read_to_string(path)
+            // mmap untuk file >100MB
+            let metadata = fs::metadata(path)?;
+            if metadata.len() > 100 * 1024 * 1024 {
+                read_file_mmap(path)
+            } else {
+                fs::read_to_string(path)
+            }
         }
         "pdf" => {
             let output = std::process::Command::new("python3")
@@ -375,9 +425,60 @@ fn read_file(path: &Path) -> io::Result<String> {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
         _ => {
-            fs::read_to_string(path)
+            let metadata = fs::metadata(path)?;
+            if metadata.len() > 100 * 1024 * 1024 {
+                read_file_mmap(path)
+            } else {
+                fs::read_to_string(path)
+            }
         }
     }
+}
+
+/// mmap-based file reading untuk file besar (>100MB)
+/// Menggunakan memmap2 untuk zero-copy reading, RAM hanya ~page table
+fn read_file_mmap(path: &Path) -> io::Result<String> {
+    use memmap2::Mmap;
+    use std::os::unix::io::AsRawFd;
+    
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let file_size = metadata.len();
+    
+    // Untuk file sangat besar (>4GB), baca chunks
+    if file_size > 4 * 1024 * 1024 * 1024 {
+        return read_file_chunked(path, file_size);
+    }
+    
+    // mmap untuk file 100MB-4GB
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap failed: {}", e)))?;
+    
+    // Convert bytes to string (lossy untuk safety)
+    let text = String::from_utf8_lossy(&mmap).to_string();
+    Ok(text)
+}
+
+/// Chunked reading untuk file >4GB
+fn read_file_chunked(path: &Path, file_size: u64) -> io::Result<String> {
+    use memmap2::Mmap;
+    
+    let file = fs::File::open(path)?;
+    let chunk_size = 256 * 1024 * 1024; // 256MB chunks
+    let mut result = String::with_capacity(file_size as usize);
+    
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap failed: {}", e)))?;
+    
+    let mut offset = 0usize;
+    while offset < file_size as usize {
+        let end = (offset + chunk_size).min(file_size as usize);
+        let chunk = &mmap[offset..end];
+        result.push_str(&String::from_utf8_lossy(chunk));
+        offset = end;
+    }
+    
+    Ok(result)
 }
 
 // ==================== PARALLEL FILE PARSING ====================

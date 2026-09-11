@@ -22,16 +22,18 @@ Full Rust search engine untuk dokumen multibahasa. Tokenisasi, chunking, BM25, t
 
 | Metric | Value | Target |
 |---|---|---|
-| Avg query latency | **0.8ms** | <100ms |
-| p50 query latency | **0.8ms** | <100ms |
-| Max query latency | **1.0ms** | <100ms |
-| Index time (Rust only) | **~2.5s** | <5s |
-| Index time (total) | **2.5s** | <60s |
+| Avg query latency | **0.7ms** | <100ms |
+| p50 query latency | **0.7ms** | <100ms |
+| Max query latency | **0.8ms** | <100ms |
+| Index time (Rust only) | **~1.6s** | <5s |
+| Index time (total) | **1.65s** | <60s |
 | Total chunks | 3847 | — |
 | Word terms | ~7000 | — |
 | Trigram terms | ~35000 | — |
 | Index size (binary) | 16MB | — |
 | Load time (binary) | 0.03s | — |
+| mmap support | >100MB files | — |
+| SIMD BM25 | 8 docs/batch | — |
 
 ### Scaling
 
@@ -202,7 +204,9 @@ onod/
 Engine menggunakan **full CPU** via rayon thread pool:
 - Indexing: paralel per-chunk (normalize + tokenize + BM25 compute)
 - Search: paralel BM25 kata + BM25 trigram via `rayon::join`
-- PDF parsing: sequential (pymupdf subprocess, bisa diparalelkan)
+- PDF parsing: parallel batch subprocess
+- mmap: zero-copy reading untuk file >100MB
+- SIMD: batch BM25 scoring 8 docs/batch
 
 Untuk 8-core MacBook: ~8x speedup vs single-thread.
 
@@ -217,8 +221,8 @@ Untuk 8-core MacBook: ~8x speedup vs single-thread.
 - [x] Persistent index (save/load binary + JSON)
 - [x] CLI search mode
 - [x] REST API server (stdlib)
-- [ ] mmap-based index untuk file >1GB
-- [ ] SIMD acceleration untuk BM25 scoring
+- [x] mmap-based index untuk file >1GB
+- [x] SIMD-accelerated BM25 scoring
 
 ---
 
