@@ -402,7 +402,6 @@ fn read_file(path: &Path) -> io::Result<String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
         "txt"|"md"|"log"|"csv"|"tsv"|"json"|"jsonl"|"html"|"htm"|"xml" => {
-            // mmap untuk file >100MB
             let metadata = fs::metadata(path)?;
             if metadata.len() > 100 * 1024 * 1024 {
                 read_file_mmap(path)
@@ -411,13 +410,38 @@ fn read_file(path: &Path) -> io::Result<String> {
             }
         }
         "pdf" => {
+            // Coba pymupdf dulu, kalau gagal coba pdftotext (poppler)
             let output = std::process::Command::new("python3")
                 .args(["-c", &format!(
                     "import pymupdf; doc=pymupdf.open('{}'); print('\\n\\n'.join(p.get_text() for p in doc))",
                     path.display()
                 )])
-                .output()?;
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                .output();
+            
+            match output {
+                Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+                    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+                }
+                _ => {
+                    // Fallback: coba pdftotext (poppler-utils)
+                    let fallback = std::process::Command::new("pdftotext")
+                        .arg(path)
+                        .arg("-")
+                        .output();
+                    
+                    match fallback {
+                        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+                            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+                        }
+                        _ => {
+                            // Terakhir: skip PDF dengan warning
+                            eprintln!("  WARNING: Cannot parse PDF {} (install pymupdf or poppler-utils)", 
+                                path.file_name().unwrap_or_default().to_string_lossy());
+                            Ok(String::new())
+                        }
+                    }
+                }
+            }
         }
         _ => {
             let metadata = fs::metadata(path)?;
@@ -740,9 +764,16 @@ fn main() {
             for (path, result) in &results {
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 match result {
-                    Ok(text) => {
+                    Ok(text) if !text.is_empty() => {
                         let chunks = idx.add_text(&text, &name, 0);
-                        eprintln!("  {} -> {} chunks", name, chunks);
+                        if chunks > 0 {
+                            eprintln!("  {} -> {} chunks", name, chunks);
+                        } else {
+                            eprintln!("  {} -> 0 chunks (skipped)", name);
+                        }
+                    }
+                    Ok(_) => {
+                        eprintln!("  {} -> empty (skipped - install pymupdf for PDF support)", name);
                     }
                     Err(e) => eprintln!("  {} -> ERROR: {}", name, e),
                 }
