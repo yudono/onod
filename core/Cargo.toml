@@ -1,6 +1,6 @@
 [package]
 name = "core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [[bin]]
@@ -16,3 +16,4 @@ serde_json = "1"
 bincode = "1"
 log = "0.4"
 pdf_oxide = "0.3"
+model2vec-rs = "0.2"

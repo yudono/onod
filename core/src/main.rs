@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
+use model2vec_rs::model::StaticModel;
 
 // ==================== DYNAMIC CONFIG ====================
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -159,8 +160,17 @@ impl SynonymLearner {
         }
     }
     
-    // Auto-learn synonyms berdasarkan context similarity
+    // Auto-learn synonyms berdasarkan embedding similarity (model2vec)
     fn learn_synonyms(&mut self, min_similarity: f64, max_per_term: usize) {
+        // Coba load model2vec untuk embedding-based synonyms
+        let model = match StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("  Warning: model2vec load failed, using context similarity: {}", e);
+                None
+            }
+        };
+        
         let terms: Vec<String> = self.term_df.keys()
             .filter(|t| t.len() > 3 && !self.stopwords.contains(t.as_str()))
             .cloned()
@@ -169,22 +179,32 @@ impl SynonymLearner {
         let mut synonym_groups: Vec<Vec<String>> = Vec::new();
         let mut processed: HashSet<String> = HashSet::new();
         
-        for term in &terms {
-            if processed.contains(term) { continue; }
+        if let Some(ref m) = model {
+            // Model2Vec: encode semua terms, lalu cari similarity
+            eprintln!("  Using model2vec for embedding-based synonyms...");
             
-            if let Some(ctx1) = self.term_context.get(term) {
+            // Encode semua terms
+            let embeddings = m.encode(&terms);
+            
+            // Build similarity matrix
+            for (i, term) in terms.iter().enumerate() {
+                if processed.contains(term) { continue; }
+                
                 let mut group = vec![term.clone()];
                 processed.insert(term.clone());
                 
-                for other in &terms {
-                    if processed.contains(other) { continue; }
-                    if let Some(ctx2) = self.term_context.get(other) {
-                        let similarity = self.context_similarity(ctx1, ctx2);
-                        if similarity >= min_similarity {
-                            group.push(other.clone());
-                            processed.insert(other.clone());
-                            if group.len() >= max_per_term { break; }
-                        }
+                let emb_i = &embeddings[i];
+                
+                for (j, other) in terms.iter().enumerate() {
+                    if processed.contains(other) || i == j { continue; }
+                    
+                    let emb_j = &embeddings[j];
+                    let similarity = Self::cosine_similarity(emb_i, emb_j);
+                    
+                    if similarity >= min_similarity {
+                        group.push(other.clone());
+                        processed.insert(other.clone());
+                        if group.len() >= max_per_term { break; }
                     }
                 }
                 
@@ -192,12 +212,47 @@ impl SynonymLearner {
                     synonym_groups.push(group);
                 }
             }
+        } else {
+            // Fallback: context similarity
+            for term in &terms {
+                if processed.contains(term) { continue; }
+                if let Some(ctx1) = self.term_context.get(term) {
+                    let mut group = vec![term.clone()];
+                    processed.insert(term.clone());
+                    for other in &terms {
+                        if processed.contains(other) { continue; }
+                        if let Some(ctx2) = self.term_context.get(other) {
+                            let similarity = self.context_similarity(ctx1, ctx2);
+                            if similarity >= min_similarity {
+                                group.push(other.clone());
+                                processed.insert(other.clone());
+                                if group.len() >= max_per_term { break; }
+                            }
+                        }
+                    }
+                    if group.len() > 1 { synonym_groups.push(group); }
+                }
+            }
         }
         
         self.synonym_groups = synonym_groups;
     }
     
-    // Hitung similarity antara 2 context vectors (cosine similarity)
+    // Cosine similarity antara 2 vectors
+    fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f64 {
+        let mut dot_product = 0.0;
+        let mut norm1 = 0.0;
+        let mut norm2 = 0.0;
+        for i in 0..v1.len().min(v2.len()) {
+            dot_product += v1[i] as f64 * v2[i] as f64;
+            norm1 += v1[i] as f64 * v1[i] as f64;
+            norm2 += v2[i] as f64 * v2[i] as f64;
+        }
+        let norm = norm1.sqrt() * norm2.sqrt();
+        if norm > 0.0 { dot_product / norm } else { 0.0 }
+    }
+    
+    // Context similarity antara 2 context vectors
     fn context_similarity(&self, ctx1: &HashMap<String, usize>, ctx2: &HashMap<String, usize>) -> f64 {
         let all_words: HashSet<&String> = ctx1.keys().chain(ctx2.keys()).collect();
         if all_words.is_empty() { return 0.0; }
