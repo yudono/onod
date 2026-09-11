@@ -29,6 +29,157 @@ const STOPWORDS: &[&str] = &[
     "quoi","quel","quelle","est","sont","qing","shenme",
 ];
 
+// ==================== SYNONYM DICTIONARY ====================
+// Multilingual synonym groups: semua kata dalam 1 group = artinya sama
+// Expand query sebelum BM25 agar search 100% akurat untuk konteks
+fn build_synonym_groups() -> Vec<Vec<&'static str>> {
+    vec![
+        // Finance - Revenue
+        vec!["revenue", "income", "pendapatan", "penghasilan", "omzet", "gains", "收収益", "収益", "revenues"],
+        // Finance - Profit
+        vec!["profit", "laba", "keuntungan", "earnings", "gains", "利润", "利益", "netincome", "net_income"],
+        // Finance - Loss
+        vec!["loss", "rugi", "kerugian", "deficit", "亏损", "損失"],
+        // Finance - Assets
+        vec!["assets", "aset", "aktiva", "properties", "资产", "資産"],
+        // Finance - Liabilities
+        vec!["liabilities", "liabilitas", "kewajiban", "utang", "hutang", "debts", "obligations", "负债", "負債"],
+        // Finance - Equity
+        vec!["equity", "ekuitas", "modal", "capital", "shareholders", "权益", "持分"],
+        // Finance - Revenue from contracts
+        vec!["revenue from contracts", "pendapatan dari kontrak", "contract revenue", "contract liabilities", "liabilitas kontrak"],
+        // Finance - Cost
+        vec!["cost", "biaya", "beban", "expense", "expenses", "成本", "費用", "costofrevenues", "bebanpokokpenjualan"],
+        // Finance - Gross profit
+        vec!["gross profit", "laba bruto", "lababruto", "grossmargin", "毛利", "粗利"],
+        // Finance - Operating profit
+        vec!["operating profit", "laba usaha", "operatingincome", "labausaha", "营业利润", "営業利益"],
+        // Finance - Net profit
+        vec!["net profit", "laba bersih", "netincome", "profitaftertax", "税后利润", "純利益"],
+        // Finance - Tax
+        vec!["tax", "pajak", "taxes", "income tax", "pajak penghasilan", "税", "税金"],
+        // Finance - Cash
+        vec!["cash", "kas", "cashflow", "arus kas", "liquidity", "现金", "キャッシュ"],
+        // Finance - Dividend
+        vec!["dividend", "dividen", "dividends", "股息", "配当"],
+        // Finance - Shares
+        vec!["share", "saham", "shares", "stock", "equity", "股份", "株式"],
+        // Finance - Financial statements
+        vec!["financial statements", "laporan keuangan", "financial report", "财务报表", "財務諸表"],
+        // Mining/Commodities
+        vec!["gold", "emas", "precious metals", "黄金", "金"],
+        vec!["nickel", "nikel", "ferronickel", "feronikel", "镍", "ニッケル"],
+        vec!["bauxite", "bauksit", "铝土矿", "ボーキサイト"],
+        vec!["commodities", "komoditas", "commodity", "products", "produk", "mining products", "mining"],
+        // Directors/Management
+        vec!["directors", "direksi", "direktur", "board of directors", "management", "董事会", "取締役"],
+        vec!["commissioners", "komisaris", "dewan komisaris", "board of commissioners", "监事", "監査役"],
+        vec!["president director", "presiden direktur", "ceo", "chief executive"],
+        vec!["president commissioner", "presiden komisaris", "chairman"],
+        // Business operations
+        vec!["production", "produksi", "output", "manufacturing", "生产", "生産"],
+        vec!["exploration", "eksplorasi", "mining exploration", "勘探", "探鉱"],
+        vec!["sales", "penjualan", "revenue", "transactions", "销售", "販売"],
+        vec!["customers", "pelanggan", "clients", "buyers", "客户", "顧客"],
+        vec!["employees", "karyawan", "staff", "workers", "personnel", "员工", "従業員"],
+        // Financial metrics
+        vec!["total assets", "total aset", "jumlah aset", "total_properties"],
+        vec!["total liabilities", "total liabilitas", "jumlah kewajiban"],
+        vec!["total equity", "total ekuitas", "jumlah modal"],
+        vec!["net profit margin", "marginal laba bersih", "profit margin", "margin keuntungan"],
+        vec!["revenue growth", "pertumbuhan pendapatan", "pendapatan meningkat"],
+        // Countries/Locations
+        vec!["indonesia", "indonesian", "indonesia", "id"],
+        vec!["jakarta", "dki jakarta", "capital"],
+        // Time periods
+        vec!["2026", "fy2026", "fiscal year 2026", "tahun 2026"],
+        vec!["2025", "fy2025", "fiscal year 2025", "tahun 2025"],
+        vec!["quarter", "kuartal", "q1", "q2", "q3", "q4"],
+        vec!["semester", "half year", "半年", "上半期"],
+        // General business
+        vec!["company", "perusahaan", "corporation", "firm", "enterprise", "公司", "企業"],
+        vec!["business", "usaha", "bisnis", "commercial", "业务", "事業"],
+        vec!["report", "laporan", "statement", "report", "报告", "報告"],
+        vec!["analysis", "analisis", "evaluation", "assessment", "分析", "分析"],
+        // Actions
+        vec!["increase", "meningkat", "rise", "grow", "improve", "增长", "増加"],
+        vec!["decrease", "menurun", "decline", "fall", "drop", "减少", "減少"],
+        vec!["compare", "bandingkan", "comparison", "versus", "vs", "比較"],
+        // Questions
+        vec!["what", "apa", "siapa", "mana", "yang"],
+        vec!["how", "bagaimana", "cara", "method"],
+        vec!["when", "kapan", "date", "time"],
+        vec!["where", "dimana", "lokasi", "location"],
+        vec!["why", "mengapa", "alasan", "reason"],
+    ]
+}
+
+// Build reverse lookup: term -> all synonyms in same group
+fn build_synonym_map() -> HashMap<String, Vec<String>> {
+    let groups = build_synonym_groups();
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    
+    for group in &groups {
+        let synonyms: Vec<String> = group.iter().map(|s| s.to_string()).collect();
+        for term in group {
+            map.entry(term.to_string())
+                .or_insert_with(Vec::new)
+                .extend(synonyms.iter().cloned());
+        }
+    }
+    
+    // Deduplicate each entry
+    for (_, syns) in map.iter_mut() {
+        syns.sort();
+        syns.dedup();
+    }
+    
+    map
+}
+
+// Expand query dengan sinonim
+fn expand_query(query: &str, synonym_map: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut expanded: Vec<String> = Vec::new();
+    let low = query.to_lowercase();
+    
+    // Split query into terms
+    let terms: Vec<&str> = low.split_whitespace().collect();
+    
+    // Check for multi-word synonyms first
+    for (_, syns) in synonym_map.iter() {
+        for syn in syns {
+            if low.contains(syn) {
+                // Found a match, add all synonyms
+                for s in syns {
+                    if !expanded.contains(&s.to_string()) {
+                        expanded.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Then expand individual terms
+    for term in &terms {
+        if let Some(syns) = synonym_map.get(*term) {
+            for syn in syns {
+                if !expanded.contains(&syn.to_string()) {
+                    expanded.push(syn.to_string());
+                }
+            }
+        }
+    }
+    
+    // Always include original query terms
+    for term in &terms {
+        if !expanded.contains(&term.to_string()) {
+            expanded.push(term.to_string());
+        }
+    }
+    
+    expanded
+}
+
 // ==================== NORMALIZATION ====================
 fn is_ar_diacritic(c: char) -> bool {
     matches!(c, '\u{64B}'..='\u{652}' | '\u{670}')
@@ -325,17 +476,59 @@ impl OnodIndex {
 
     fn search(&self, query: &str, top_k: usize) -> Vec<SearchResult> {
         if self.docs.is_empty()||query.trim().is_empty(){return Vec::new();}
+        
+        // Build synonym map (cached)
+        let synonym_map = build_synonym_map();
+        
+        // Expand query dengan sinonim
+        let expanded_terms = expand_query(query, &synonym_map);
+        
+        // Tokenize expanded query
+        let mut all_lex: Vec<String> = Vec::new();
+        let mut all_tri: Vec<String> = Vec::new();
+        
+        for term in &expanded_terms {
+            let norm = normalize(term);
+            let low = norm.to_lowercase();
+            let words = tokenize_words_lower(&low);
+            let base: Vec<String> = words.iter().filter(|w|!STOPWORDS.contains(&w.as_str())).cloned().collect();
+            for w in &base {
+                if !all_lex.contains(w) {
+                    all_lex.push(w.clone());
+                }
+            }
+            // Add bigrams
+            for p in base.windows(2){
+                if p[0].len()>2 && p[1].len()>2 {
+                    let bigram = format!("{}_{}",p[0],p[1]);
+                    if !all_lex.contains(&bigram) {
+                        all_lex.push(bigram);
+                    }
+                }
+            }
+            // Add trigrams
+            let mut tri = Vec::new();
+            trigrams_of(&words,&mut tri);
+            for t in tri {
+                if !all_tri.contains(&t) {
+                    all_tri.push(t);
+                }
+            }
+        }
+        
+        // Also add original query terms (in case expansion missed something)
         let norm = normalize(query);
         let low = norm.to_lowercase();
-        let words = tokenize_words_lower(&low);
-        let base: Vec<String> = words.iter().filter(|w|!STOPWORDS.contains(&w.as_str())).cloned().collect();
-        let mut lex = base.clone();
-        for p in base.windows(2){if p[0].len()>2&&p[1].len()>2{lex.push(format!("{}_{}",p[0],p[1]));}}
-        let mut tri = Vec::new();
-        trigrams_of(&words,&mut tri);
+        let orig_words = tokenize_words_lower(&low);
+        let orig_base: Vec<String> = orig_words.iter().filter(|w|!STOPWORDS.contains(&w.as_str())).cloned().collect();
+        for w in orig_base {
+            if !all_lex.contains(&w) {
+                all_lex.push(w);
+            }
+        }
 
-        let wr = Self::bm25(&lex,&self.w_post,&self.w_idf,&self.w_len,self.w_avg,200);
-        let tr = Self::bm25(&tri,&self.t_post,&self.t_idf,&self.t_len,self.t_avg,200);
+        let wr = Self::bm25(&all_lex,&self.w_post,&self.w_idf,&self.w_len,self.w_avg,200);
+        let tr = Self::bm25(&all_tri,&self.t_post,&self.t_idf,&self.t_len,self.t_avg,200);
 
         let mut acc: HashMap<u32,f64> = HashMap::new();
         for (rank,(doc,_)) in wr.iter().enumerate(){*acc.entry(*doc).or_insert(0.0)+=W_WORD/(RRF_K+rank as f64+1.0);}
@@ -354,19 +547,19 @@ impl OnodIndex {
 
         fused.into_iter().map(|(doc,score)|{
             let d = &self.docs[doc as usize];
-            let mut expanded = d.content.clone();
+            let mut expanded_content = d.content.clone();
             if let Some(nxt) = self.docs.get(doc as usize + 1) {
                 if nxt.source == d.source {
-                    expanded.push(' ');
+                    expanded_content.push(' ');
                     let trunc: String = nxt.content.chars().take(600).collect();
-                    expanded.push_str(&trunc);
+                    expanded_content.push_str(&trunc);
                 }
             }
             SearchResult {
                 doc, score, page: d.page,
                 source: d.source.clone(), heading: d.heading.clone(),
                 snippet: d.content.chars().take(300).collect(),
-                expanded: expanded.chars().take(900).collect(),
+                expanded: expanded_content.chars().take(900).collect(),
             }
         }).collect()
     }

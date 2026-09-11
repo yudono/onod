@@ -8,5 +8,4 @@ venv/
 .DS_Store
 *.npz
 *.bin
-files/*.pdf
 core/target/
