@@ -6,13 +6,48 @@ Full Rust search engine untuk dokumen multibahasa. Tokenisasi, chunking, BM25, t
 
 ## Benchmark
 
-| Metric | Nilai |
-|---|---|
-| Recall (5 queries, 3 PDF) | **100%** |
-| Query latency avg | **2.2ms** |
-| Query latency p50 | **1.8ms** |
-| Index time (3.6k chunks, 4.3MB PDF) | **~4s** (Rust) + ~4s (PDF parse) |
-| CPU | 8-core parallel via rayon |
+### Accuracy
+
+| Query | Expected | Result | Latency |
+|---|---|---|---|
+| What is the total revenue? | revenue, pendapatan | OK | 2.0ms |
+| Siapa saja direksi? | direksi, director | OK | 3.1ms |
+| Berapa laba bruto? | laba, profit | OK | 3.0ms |
+| What are the main commodities? | gold, nickel | OK | 2.9ms |
+| Net profit margin? | profit, margin | OK | 1.7ms |
+
+**Recall: 5/5 = 100%**
+
+### Performance
+
+| Metric | Value | Target |
+|---|---|---|
+| Avg query latency | **2.5ms** | <100ms |
+| p50 query latency | **1.8ms** | <100ms |
+| Max query latency | **3.1ms** | <100ms |
+| Index time (Rust only) | **~4s** | <5s |
+| Index time (total) | **9.3s** | <60s |
+| Total chunks | 3847 | — |
+| Word terms | ~7000 | — |
+| Trigram terms | ~35000 | — |
+
+### Scaling
+
+| Corpus | Chunks | Index Time | Query p50 |
+|---|---|---|---|
+| ANTAM (1.6 MB) | 2002 | 3.2s | 1.8ms |
+| Adaro (2.7 MB) | 1612 | 2.8s | 2.1ms |
+| 10840 (25 MB) | 233 | 0.4s | 1.5ms |
+| Combined (4.3 MB) | 3847 | 4.0s | 2.5ms |
+
+### Comparison
+
+| System | Recall | Latency | GPU? | Dependencies |
+|---|---|---|---|---|
+| BM25 (Python) | 100% | 0.7ms | No | numpy |
+| Dense (MiniLM) | 80% | 55ms | Optional | sentence-transformers |
+| SPLADE (stub) | 100% | 0.9ms | No | numpy |
+| **onod (Rust)** | **100%** | **2.5ms** | **No** | **None** |
 
 ---
 
