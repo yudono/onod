@@ -2,7 +2,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Write, BufRead, BufReader};
+use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -388,11 +388,6 @@ impl OnodIndex {
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)
     }
-
-    fn load_json(path: &Path) -> io::Result<Self> {
-        let json = fs::read_to_string(path)?;
-        serde_json::from_str(&json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -439,7 +434,6 @@ fn read_file(path: &Path) -> io::Result<String> {
 /// Menggunakan memmap2 untuk zero-copy reading, RAM hanya ~page table
 fn read_file_mmap(path: &Path) -> io::Result<String> {
     use memmap2::Mmap;
-    use std::os::unix::io::AsRawFd;
     
     let file = fs::File::open(path)?;
     let metadata = file.metadata()?;
