@@ -1,0 +1,20 @@
+1. What is the total revenue? -> revenue, pendapatan, 62.714
+2. Berapa total pendapatan? -> pendapatan, revenue, 62.714
+3. Income from customer contracts? -> income, pendapatan, 62.714
+4. Penghasilan perusahaan? -> penghasilan, income, 62.714
+5. Revenue from sales? -> revenue, penjualan, sales
+6. Berapa laba bruto? -> laba, gross, profit, 10.851
+7. What is gross profit? -> gross, profit, 10.851
+8. Laba bersih berapa? -> laba, bersih, net, 8.443
+9. Net profit margin? -> profit, margin, net
+10. Keuntungan bersih? -> keuntungan, bersih, profit
+11. Total aset berapa? -> aset, assets, total
+12. What are total assets? -> assets, total, aset
+13. Berapa utang perusahaan? -> utang, liabilities, debt
+14. Total liabilities? -> liabilities, utang, kewajiban
+15. Modal pemegang saham? -> modal, equity, saham
+16. Emas produksi berapa? -> emas, gold, produksi
+17. Gold production? -> gold, emas, production
+18. Direksi siapa saja? -> direksi, director, Untung
+19. Dividen berapa? -> dividen, dividend, 5 triliun
+20. Arus kas operasi? -> arus, kas, operasi, cash
