@@ -1,6 +1,47 @@
 # onod — Rust Search Engine
 
-Full Rust search engine untuk dokumen multibahasa. Tokenisasi, chunking, BM25, trigram, bigram, RRF fusion — semuanya parallel di CPU.
+Full Rust search engine untuk dokumen multibahasa. **Hybrid BM25 + Model2Vec embeddings** — akurat seperti vector search, cepat seperti keyword search.
+
+---
+
+## Arsitektur
+
+```
+Document (PDF/TXT/DOCX)
+    ↓
+PDF Parser (pdf_oxide, Rust-native, 0.8ms)
+    ↓
+Chunking (600 char, kalimat-aware, overlap 140)
+    ↓
+┌─────────────┬─────────────┬─────────────┐
+│ BM25 Kata   │ Char-Trigram│ Phrase      │
+│ (exact)     │ (typo)      │ Bigram      │
+└──────┬──────┴──────┬──────┴──────┬──────┘
+       │             │             │
+       ↓             ↓             ↓
+    RRF Fusion (scale-free)
+       │
+       ↓
+    Model2Vec Embeddings (potion-base-8M)
+    → Cosine similarity untuk sinonim otomatis
+       │
+       ↓
+    Financial Boost (angka + terms)
+       │
+       ↓
+    Top-K Results
+```
+
+### Komponen Utama
+
+| Komponen | Fungsi | Kecepatan |
+|---|---|---|
+| **pdf_oxide** | PDF parsing | 0.8ms/page |
+| **BM25** | Keyword search | 0.5ms |
+| **Char-Trigram** | Typo tolerance | - |
+| **Model2Vec** | Semantic embeddings | 8M params, CPU-only |
+| **RRF** | Score fusion | - |
+| **Rayon** | Parallelism | 8-core |
 
 ---
 
@@ -189,15 +230,17 @@ onod/
 | `unicode-normalization` | NFKC normalization |
 | `memmap2` | Memory-mapped file I/O |
 | `serde` + `serde_json` | Serialization |
+| `pdf_oxide` | PDF parsing (Rust-native) |
+| `model2vec-rs` | Static embeddings (8M params) |
 
 ---
 
 ## CPU Usage
 
 Engine menggunakan **full CPU** via rayon thread pool:
-- Indexing: paralel per-chunk (normalize + tokenize + BM25 compute)
-- Search: paralel BM25 kata + BM25 trigram via `rayon::join`
-- PDF parsing: parallel batch subprocess
+- Indexing: paralel per-chunk + Model2Vec embeddings
+- Search: paralel BM25 kata + BM25 trigram + semantic similarity
+- PDF parsing: pdf_oxide (Rust-native, no Python)
 - mmap: zero-copy reading untuk file >100MB
 - SIMD: batch BM25 scoring 8 docs/batch
 
