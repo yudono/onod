@@ -33,10 +33,15 @@ struct Config {
     num_boost: f64,
     financial_boost: f64,
     
-    // Dynamic terms
+    // Dynamic terms (kosong = auto-learn dari corpus)
     financial_terms: Vec<String>,
     stopwords: Vec<String>,
     synonym_groups: Vec<Vec<String>>,
+    
+    // Auto-learn settings
+    auto_learn_synonyms: bool,
+    min_cooccurrence: usize,
+    max_synonyms_per_term: usize,
 }
 
 impl Default for Config {
@@ -55,62 +60,226 @@ impl Default for Config {
             financial_term_threshold: 20,
             num_boost: 0.3,
             financial_boost: 0.4,
-            financial_terms: vec![
-                "laba".into(), "rugi".into(), "aset".into(), "liabilitas".into(),
-                "ekuitas".into(), "pendapatan".into(), "dividen".into(), "arus kas".into(),
-                "penjualan".into(), "beban".into(), "modal".into(), "piutang".into(),
-                "revenue".into(), "income".into(), "profit".into(), "loss".into(),
-                "assets".into(), "equity".into(), "dividend".into(), "cash flow".into(),
-                "sales".into(), "cost".into(), "expense".into(), "capital".into(),
-                "margin".into(), "growth".into(), "tax".into(), "pajak".into(),
-            ],
-            stopwords: vec![
-                "berapa".into(), "siapa".into(), "apa".into(), "bagaimana".into(),
-                "what".into(), "how".into(), "who".into(), "is".into(), "are".into(),
-                "the".into(), "a".into(), "an".into(),
-            ],
-            synonym_groups: vec![
-                vec!["revenue".into(), "income".into(), "pendapatan".into(), "penghasilan".into()],
-                vec!["profit".into(), "laba".into(), "keuntungan".into(), "earnings".into()],
-                vec!["loss".into(), "rugi".into(), "kerugian".into()],
-                vec!["assets".into(), "aset".into(), "aktiva".into()],
-                vec!["equity".into(), "ekuitas".into(), "modal".into()],
-            ],
+            financial_terms: vec![], // kosong = auto-learn
+            stopwords: vec![], // kosong = auto-learn
+            synonym_groups: vec![], // kosong = auto-learn
+            auto_learn_synonyms: true,
+            min_cooccurrence: 3,
+            max_synonyms_per_term: 10,
         }
+    }
+}
+
+// ==================== AUTO-LEARN SYNONYMS ====================
+struct SynonymLearner {
+    // Term -> document frequency
+    term_df: HashMap<String, usize>,
+    // Term -> set of documents containing it
+    term_docs: HashMap<String, HashSet<u32>>,
+    // Term -> context words (surrounding words within window)
+    term_context: HashMap<String, HashMap<String, usize>>,
+    // Learned synonym groups
+    synonym_groups: Vec<Vec<String>>,
+    // Financial terms (auto-learned)
+    financial_terms: HashSet<String>,
+    // Stopwords (auto-learned)
+    stopwords: HashSet<String>,
+}
+
+impl SynonymLearner {
+    fn new() -> Self {
+        Self {
+            term_df: HashMap::new(),
+            term_docs: HashMap::new(),
+            term_context: HashMap::new(),
+            synonym_groups: Vec::new(),
+            financial_terms: HashSet::new(),
+            stopwords: HashSet::new(),
+        }
+    }
+    
+    // Learn dari corpus saat indexing
+    fn learn_from_text(&mut self, text: &str, doc_id: u32, window_size: usize) {
+        let words: Vec<String> = text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2)
+            .map(|w| w.to_string())
+            .collect();
+        
+        // Update document frequency
+        let mut seen_in_doc: HashSet<String> = HashSet::new();
+        for word in &words {
+            if !seen_in_doc.contains(word) {
+                *self.term_df.entry(word.clone()).or_insert(0) += 1;
+                seen_in_doc.insert(word.clone());
+                self.term_docs.entry(word.clone()).or_insert_with(HashSet::new).insert(doc_id);
+            }
+        }
+        
+        // Build context vectors (co-occurrence within window)
+        for (i, word) in words.iter().enumerate() {
+            let start = i.saturating_sub(window_size);
+            let end = (i + window_size + 1).min(words.len());
+            let context = &words[start..end];
+            
+            let ctx_map = self.term_context.entry(word.clone()).or_insert_with(HashMap::new);
+            for ctx_word in context {
+                if ctx_word != word {
+                    *ctx_map.entry(ctx_word.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    
+    // Auto-learn financial terms dari corpus
+    fn learn_financial_terms(&mut self, min_freq: usize) {
+        let total_docs = self.term_df.values().sum::<usize>().max(1);
+        
+        for (term, &df) in &self.term_df {
+            // Financial terms: muncul di banyak dokumen + sering dengan angka
+            if df >= min_freq && df as f64 / total_docs as f64 > 0.1 {
+                // Cek apakah term sering muncul dekat angka
+                if let Some(ctx) = self.term_context.get(term) {
+                    let has_number_ctx = ctx.keys().any(|k| k.chars().all(|c| c.is_ascii_digit()));
+                    if has_number_ctx {
+                        self.financial_terms.insert(term.clone());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Auto-learn stopwords (term yang terlalu umum)
+    fn learn_stopwords(&mut self, max_df_ratio: f64) {
+        let total_docs = self.term_df.values().max().copied().unwrap_or(1) as f64;
+        for (term, &df) in &self.term_df {
+            if df as f64 / total_docs > max_df_ratio {
+                self.stopwords.insert(term.clone());
+            }
+        }
+    }
+    
+    // Auto-learn synonyms berdasarkan context similarity
+    fn learn_synonyms(&mut self, min_similarity: f64, max_per_term: usize) {
+        let terms: Vec<String> = self.term_df.keys()
+            .filter(|t| t.len() > 3 && !self.stopwords.contains(t.as_str()))
+            .cloned()
+            .collect();
+        
+        let mut synonym_groups: Vec<Vec<String>> = Vec::new();
+        let mut processed: HashSet<String> = HashSet::new();
+        
+        for term in &terms {
+            if processed.contains(term) { continue; }
+            
+            if let Some(ctx1) = self.term_context.get(term) {
+                let mut group = vec![term.clone()];
+                processed.insert(term.clone());
+                
+                for other in &terms {
+                    if processed.contains(other) { continue; }
+                    if let Some(ctx2) = self.term_context.get(other) {
+                        let similarity = self.context_similarity(ctx1, ctx2);
+                        if similarity >= min_similarity {
+                            group.push(other.clone());
+                            processed.insert(other.clone());
+                            if group.len() >= max_per_term { break; }
+                        }
+                    }
+                }
+                
+                if group.len() > 1 {
+                    synonym_groups.push(group);
+                }
+            }
+        }
+        
+        self.synonym_groups = synonym_groups;
+    }
+    
+    // Hitung similarity antara 2 context vectors (cosine similarity)
+    fn context_similarity(&self, ctx1: &HashMap<String, usize>, ctx2: &HashMap<String, usize>) -> f64 {
+        let all_words: HashSet<&String> = ctx1.keys().chain(ctx2.keys()).collect();
+        if all_words.is_empty() { return 0.0; }
+        
+        let mut dot_product = 0.0;
+        let mut norm1 = 0.0;
+        let mut norm2 = 0.0;
+        
+        for word in &all_words {
+            let v1 = ctx1.get(*word).copied().unwrap_or(0) as f64;
+            let v2 = ctx2.get(*word).copied().unwrap_or(0) as f64;
+            dot_product += v1 * v2;
+            norm1 += v1 * v1;
+            norm2 += v2 * v2;
+        }
+        
+        let norm = norm1.sqrt() * norm2.sqrt();
+        if norm > 0.0 { dot_product / norm } else { 0.0 }
+    }
+    
+    // Save learned data
+    fn save(&self, path: &Path) -> io::Result<()> {
+        let data = serde_json::json!({
+            "financial_terms": self.financial_terms.iter().cloned().collect::<Vec<_>>(),
+            "stopwords": self.stopwords.iter().cloned().collect::<Vec<_>>(),
+            "synonym_groups": self.synonym_groups,
+        });
+        fs::write(path, serde_json::to_string_pretty(&data)?)
+    }
+    
+    // Load learned data
+    fn load(path: &Path) -> io::Result<Self> {
+        let data: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        let mut learner = Self::new();
+        
+        if let Some(terms) = data["financial_terms"].as_array() {
+            learner.financial_terms = terms.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        }
+        if let Some(stopwords) = data["stopwords"].as_array() {
+            learner.stopwords = stopwords.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        }
+        if let Some(groups) = data["synonym_groups"].as_array() {
+            learner.synonym_groups = groups.iter()
+                .filter_map(|g| g.as_array().map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()))
+                .collect();
+        }
+        
+        Ok(learner)
     }
 }
 
 impl Config {
     fn load() -> Self {
-        // 1. Coba load dari file JSON
+        // 1. Load base config dari file
+        let mut config = Config::default();
         let config_paths = ["onod.json", "config.json", ".onod.json"];
         for path in &config_paths {
             if let Ok(content) = fs::read_to_string(path) {
-                if let Ok(config) = serde_json::from_str::<Config>(&content) {
+                if let Ok(c) = serde_json::from_str::<Config>(&content) {
                     eprintln!("Loaded config from {}", path);
-                    return config;
+                    config = c;
+                    break;
                 }
             }
         }
         
-        // 2. Coba load dari environment variables
-        let mut config = Config::default();
-        if let Ok(val) = env::var("ONOD_CHUNK_CHARS") {
-            if let Ok(v) = val.parse() { config.chunk_chars = v; }
-        }
-        if let Ok(val) = env::var("ONOD_BM25_K1") {
-            if let Ok(v) = val.parse() { config.bm25_k1 = v; }
-        }
-        if let Ok(val) = env::var("ONOD_FINANCIAL_TERMS") {
-            config.financial_terms = val.split(',').map(|s| s.trim().to_string()).collect();
-        }
-        if let Ok(val) = env::var("ONOD_STOPWORDS") {
-            config.stopwords = val.split(',').map(|s| s.trim().to_string()).collect();
-        }
-        
-        // 3. Save default config untuk reference
-        if let Ok(content) = serde_json::to_string_pretty(&config) {
-            let _ = fs::write("onod.json", content);
+        // 2. Load learned data jika ada
+        let learned_path = Path::new("onod_learned.json");
+        if learned_path.exists() {
+            if let Ok(learner) = SynonymLearner::load(learned_path) {
+                eprintln!("Loaded learned data from {}", learned_path.display());
+                // Merge learned data jika config kosong
+                if config.financial_terms.is_empty() {
+                    config.financial_terms = learner.financial_terms.into_iter().collect();
+                }
+                if config.stopwords.is_empty() {
+                    config.stopwords = learner.stopwords.into_iter().collect();
+                }
+                if config.synonym_groups.is_empty() {
+                    config.synonym_groups = learner.synonym_groups;
+                }
+            }
         }
         
         config
@@ -326,11 +495,18 @@ struct OnodIndex {
     t_idf: HashMap<String, f64>,
     w_avg: f64,
     t_avg: f64,
+    #[serde(skip)]
+    learner: Option<SynonymLearner>,
 }
 
 impl OnodIndex {
     fn new() -> Self {
-        Self { docs:Vec::new(), w_post:HashMap::new(), t_post:HashMap::new(), w_len:Vec::new(), t_len:Vec::new(), w_idf:HashMap::new(), t_idf:HashMap::new(), w_avg:0.0, t_avg:0.0 }
+        Self { 
+            docs:Vec::new(), w_post:HashMap::new(), t_post:HashMap::new(), 
+            w_len:Vec::new(), t_len:Vec::new(), w_idf:HashMap::new(), 
+            t_idf:HashMap::new(), w_avg:0.0, t_avg:0.0,
+            learner: Some(SynonymLearner::new()),
+        }
     }
 
     fn finalize(&mut self) {
@@ -343,12 +519,39 @@ impl OnodIndex {
         let mut ti = HashMap::with_capacity(self.t_post.len());
         for (t,v) in &self.t_post { let df=v.len() as f64; ti.insert(t.clone(), ((n as f64-df+0.5)/(df+0.5)+1.0).ln()); }
         self.w_idf = wi; self.t_idf = ti;
+        
+        // Auto-learn dari corpus
+        if let Some(ref mut learner) = self.learner {
+            let cfg = get_config();
+            eprintln!("Learning from corpus...");
+            learner.learn_financial_terms(3);
+            learner.learn_stopwords(0.8);
+            learner.learn_synonyms(0.5, cfg.max_synonyms_per_term);
+            eprintln!("  Learned {} financial terms, {} stopwords, {} synonym groups",
+                learner.financial_terms.len(), learner.stopwords.len(), learner.synonym_groups.len());
+            
+            // Save learned data
+            let learned_path = Path::new("onod_learned.json");
+            if let Err(e) = learner.save(learned_path) {
+                eprintln!("  Warning: could not save learned data: {}", e);
+            } else {
+                eprintln!("  Saved learned data to {}", learned_path.display());
+            }
+        }
     }
 
     fn add_text(&mut self, text: &str, source: &str, page: u32) -> u32 {
         let norm = normalize(text);
         let cfg = get_config();
         if norm.len() < cfg.min_chunk { return 0; }
+        
+        // Auto-learn dari corpus
+        if cfg.auto_learn_synonyms {
+            if let Some(ref mut learner) = self.learner {
+                learner.learn_from_text(&norm, self.docs.len() as u32, 5);
+            }
+        }
+        
         let chunks = chunk_text(&norm);
         let analyzed: Vec<_> = chunks.into_par_iter().map(|(c,h)|{
             let (lex,tri) = analyze_text(&c);
