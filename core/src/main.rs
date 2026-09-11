@@ -410,36 +410,13 @@ fn read_file(path: &Path) -> io::Result<String> {
             }
         }
         "pdf" => {
-            // Coba pymupdf dulu, kalau gagal coba pdftotext (poppler)
-            let output = std::process::Command::new("python3")
-                .args(["-c", &format!(
-                    "import pymupdf; doc=pymupdf.open('{}'); print('\\n\\n'.join(p.get_text() for p in doc))",
-                    path.display()
-                )])
-                .output();
-            
-            match output {
-                Ok(out) if out.status.success() && !out.stdout.is_empty() => {
-                    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-                }
-                _ => {
-                    // Fallback: coba pdftotext (poppler-utils)
-                    let fallback = std::process::Command::new("pdftotext")
-                        .arg(path)
-                        .arg("-")
-                        .output();
-                    
-                    match fallback {
-                        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
-                            Ok(String::from_utf8_lossy(&out.stdout).to_string())
-                        }
-                        _ => {
-                            // Terakhir: skip PDF dengan warning
-                            eprintln!("  WARNING: Cannot parse PDF {} (install pymupdf or poppler-utils)", 
-                                path.file_name().unwrap_or_default().to_string_lossy());
-                            Ok(String::new())
-                        }
-                    }
+            // pdf_oxide: Rust-native, fastest PDF parser (0.8ms, 100% pass rate)
+            match extract_pdf_text(path) {
+                Ok(text) => Ok(text),
+                Err(e) => {
+                    eprintln!("  WARNING: PDF parse failed for {}: {}", 
+                        path.file_name().unwrap_or_default().to_string_lossy(), e);
+                    Ok(String::new())
                 }
             }
         }
@@ -452,6 +429,33 @@ fn read_file(path: &Path) -> io::Result<String> {
             }
         }
     }
+}
+
+/// pdf_oxide: extract text dari PDF (0.8ms, 100% pass rate)
+fn extract_pdf_text(path: &Path) -> io::Result<String> {
+    use pdf_oxide::PdfDocument;
+    
+    let doc = PdfDocument::open(path.to_str().unwrap_or(""))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("PDF open failed: {}", e)))?;
+    
+    let num_pages = doc.page_count()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Page count failed: {}", e)))?;
+    
+    let mut all_text = String::new();
+    
+    for page_idx in 0..num_pages {
+        match doc.extract_text_auto(page_idx) {
+            Ok(text) => {
+                all_text.push_str(&text);
+                all_text.push_str("\n\n");
+            }
+            Err(e) => {
+                eprintln!("  WARNING: Page {} extraction failed: {}", page_idx, e);
+            }
+        }
+    }
+    
+    Ok(all_text)
 }
 
 /// mmap-based file reading untuk file besar (>100MB)
