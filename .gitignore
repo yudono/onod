@@ -9,3 +9,4 @@ venv/
 *.npz
 *.bin
 files/*.pdf
+core/target/
