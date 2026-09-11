@@ -909,20 +909,40 @@ fn main() {
             let mut idx = OnodIndex::new();
             let t0 = Instant::now();
 
-            let paths: Vec<PathBuf> = fs::read_dir(folder)
-                .expect("cannot read dir")
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.'))
-                .collect();
+            // Coba load index dari file dulu (lebih cepat)
+            let index_path = Path::new(folder).join("index.bin");
+            if index_path.exists() {
+                eprintln!("Loading pre-built index from {}...", index_path.display());
+                idx = OnodIndex::load(&index_path).expect("failed to load index");
+            } else {
+                eprintln!("Building index from {}...", folder);
+                let paths: Vec<PathBuf> = fs::read_dir(folder)
+                    .expect("cannot read dir")
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        if !p.is_file() { return false; }
+                        let name = p.file_name().unwrap_or_default().to_string_lossy();
+                        if name.starts_with('.') || name == "enwik8" || name.ends_with(".DS_Store") { return false; }
+                        true
+                    })
+                    .collect();
 
-            for path in &paths {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                if let Ok(text) = read_file(path) {
-                    idx.add_text(&text, &name, 0);
+                for path in &paths {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    if let Ok(text) = read_file(path) {
+                        idx.add_text(&text, &name, 0);
+                    }
+                }
+                idx.finalize();
+                
+                // Auto-save index untuk next time
+                if let Err(e) = idx.save(&index_path) {
+                    eprintln!("Warning: could not save index: {}", e);
+                } else {
+                    eprintln!("Index saved to {}", index_path.display());
                 }
             }
-            idx.finalize();
             
             let t1 = Instant::now();
             let results = idx.search(&query, 10);
