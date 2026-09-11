@@ -22,14 +22,16 @@ Full Rust search engine untuk dokumen multibahasa. Tokenisasi, chunking, BM25, t
 
 | Metric | Value | Target |
 |---|---|---|
-| Avg query latency | **2.5ms** | <100ms |
-| p50 query latency | **1.8ms** | <100ms |
-| Max query latency | **3.1ms** | <100ms |
-| Index time (Rust only) | **~4s** | <5s |
-| Index time (total) | **9.3s** | <60s |
+| Avg query latency | **0.8ms** | <100ms |
+| p50 query latency | **0.8ms** | <100ms |
+| Max query latency | **1.0ms** | <100ms |
+| Index time (Rust only) | **~2.5s** | <5s |
+| Index time (total) | **2.5s** | <60s |
 | Total chunks | 3847 | — |
 | Word terms | ~7000 | — |
 | Trigram terms | ~35000 | — |
+| Index size (binary) | 16MB | — |
+| Load time (binary) | 0.03s | — |
 
 ### Scaling
 
@@ -210,11 +212,11 @@ Untuk 8-core MacBook: ~8x speedup vs single-thread.
 
 - [x] Full Rust core: tokenize, chunk, BM25, trigram, bigram, RRF
 - [x] Parallel indexing via rayon
-- [x] Benchmark: 100% recall, 2ms latency
-- [ ] Parallel PDF parsing (batch subprocess)
-- [ ] Persistent index (save/load binary)
-- [ ] CLI search mode
-- [ ] REST API (actix-web)
+- [x] Benchmark: 100% recall, <1ms latency
+- [x] Parallel PDF parsing (batch subprocess)
+- [x] Persistent index (save/load binary + JSON)
+- [x] CLI search mode
+- [x] REST API server (stdlib)
 - [ ] mmap-based index untuk file >1GB
 - [ ] SIMD acceleration untuk BM25 scoring
 

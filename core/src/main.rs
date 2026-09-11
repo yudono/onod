@@ -2,8 +2,10 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write, BufRead, BufReader};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
@@ -145,9 +147,7 @@ fn split_sentences(text: &str) -> Vec<String> {
         let mut rest = s.as_str();
         while rest.len() > HARD_SPLIT {
             let mut cut = HARD_SPLIT.min(rest.len());
-            // Find a safe char boundary
             while cut > 0 && !rest.is_char_boundary(cut) { cut -= 1; }
-            // Try to cut at a space
             if let Some(sp) = rest[..cut].rfind(' ') { if sp > 300 { cut = sp; } }
             while cut > 0 && !rest.is_char_boundary(cut) { cut -= 1; }
             out.push(rest[..cut].trim().to_string());
@@ -187,8 +187,10 @@ fn chunk_text(text: &str) -> Vec<(String, String)> {
 }
 
 // ==================== INDEX ====================
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Doc { content: String, source: String, page: u32, heading: String }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OnodIndex {
     docs: Vec<Doc>,
     w_post: HashMap<String, Vec<(u32,u32)>>,
@@ -324,9 +326,32 @@ impl OnodIndex {
             }
         }).collect()
     }
+
+    // ==================== PERSISTENT INDEX ====================
+    fn save(&self, path: &Path) -> io::Result<()> {
+        let file = fs::File::create(path)?;
+        let mut writer = io::BufWriter::new(file);
+        bincode::serialize_into(&mut writer, self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+    fn load(path: &Path) -> io::Result<Self> {
+        let file = fs::File::open(path)?;
+        let mut reader = io::BufReader::new(file);
+        bincode::deserialize_from(&mut reader).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+    fn save_json(&self, path: &Path) -> io::Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(path, json)
+    }
+
+    fn load_json(path: &Path) -> io::Result<Self> {
+        let json = fs::read_to_string(path)?;
+        serde_json::from_str(&json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct SearchResult {
     doc: u32, score: f64, page: u32,
     source: String, heading: String,
@@ -341,7 +366,6 @@ fn read_file(path: &Path) -> io::Result<String> {
             fs::read_to_string(path)
         }
         "pdf" => {
-            // Use pymupdf via subprocess
             let output = std::process::Command::new("python3")
                 .args(["-c", &format!(
                     "import pymupdf; doc=pymupdf.open('{}'); print('\\n\\n'.join(p.get_text() for p in doc))",
@@ -356,16 +380,173 @@ fn read_file(path: &Path) -> io::Result<String> {
     }
 }
 
+// ==================== PARALLEL FILE PARSING ====================
+fn read_files_parallel(paths: &[PathBuf]) -> Vec<(PathBuf, io::Result<String>)> {
+    use std::sync::mpsc;
+    
+    let (tx, rx) = mpsc::channel();
+    let paths_clone: Vec<PathBuf> = paths.to_vec();
+    
+    std::thread::spawn(move || {
+        let handles: Vec<_> = paths_clone.into_iter().map(|path| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = read_file(&path);
+                let _ = tx.send((path, result));
+            })
+        }).collect();
+        
+        for h in handles {
+            let _ = h.join();
+        }
+        drop(tx);
+    });
+    
+    rx.iter().collect()
+}
+
+// ==================== SIMPLE REST SERVER ====================
+fn start_server(idx: Arc<OnodIndex>, port: u16) {
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).expect("cannot bind");
+    eprintln!("Server listening on http://0.0.0.0:{}", port);
+    eprintln!("Endpoints:");
+    eprintln!("  GET /search?q=<query>&top_k=10");
+    eprintln!("  GET /health");
+    eprintln!("  GET /");
+    
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let idx = idx.clone();
+                std::thread::spawn(move || {
+                    handle_connection(stream, &idx);
+                });
+            }
+            Err(e) => eprintln!("Connection failed: {}", e),
+        }
+    }
+}
+
+fn handle_connection(mut stream: TcpStream, idx: &OnodIndex) {
+    use std::io::{BufRead, BufReader, Write};
+    
+    let mut buf_reader = BufReader::new(&stream);
+    let mut request_line = String::new();
+    buf_reader.read_line(&mut request_line).unwrap();
+    
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        stream.write_all(response.as_bytes()).unwrap();
+        return;
+    }
+    
+    let path = parts[1];
+    let response = match path {
+        "/" => {
+            let body = serde_json::json!({
+                "name": "onod",
+                "version": "0.2.0",
+                "endpoints": {
+                    "search": "/search?q=<query>&top_k=10",
+                    "health": "/health"
+                }
+            });
+            format_response(200, &body.to_string())
+        }
+        "/health" => {
+            let body = serde_json::json!({
+                "status": "ok",
+                "version": "0.2.0",
+                "chunks": idx.docs.len()
+            });
+            format_response(200, &body.to_string())
+        }
+        p if p.starts_with("/search") => {
+            let params = parse_query_string(p);
+            let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
+            let top_k: usize = params.get("top_k")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10);
+            
+            if q.is_empty() {
+                let body = serde_json::json!({"error": "missing q parameter"});
+                format_response(400, &body.to_string())
+            } else {
+                let results = idx.search(q, top_k);
+                let body = serde_json::json!({
+                    "query": q,
+                    "results": results,
+                    "count": results.len()
+                });
+                format_response(200, &body.to_string())
+            }
+        }
+        _ => {
+            let body = serde_json::json!({"error": "not found"});
+            format_response(404, &body.to_string())
+        }
+    };
+    
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn format_response(status: u16, body: &str) -> String {
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Internal Server Error",
+    };
+    format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status, status_text, body.len(), body
+    )
+}
+
+fn parse_query_string(path: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(query_start) = path.find('?') {
+        let query = &path[query_start + 1..];
+        for pair in query.split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                params.insert(
+                    urldecode(key.to_string()),
+                    urldecode(value.to_string())
+                );
+            }
+        }
+    }
+    params
+}
+
+fn urldecode(s: String) -> String {
+    s.replace("%20", " ").replace("%27", "'").replace("%22", "\"")
+}
+
 // ==================== MAIN ====================
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
+        eprintln!("onod — Full-Rust Search Engine v0.2.0");
+        eprintln!();
         eprintln!("Usage: onod <command> [args]");
+        eprintln!();
         eprintln!("Commands:");
-        eprintln!("  index <folder>        Index all files in folder");
-        eprintln!("  search <index> <query> Search an indexed folder");
-        eprintln!("  benchmark <folder>     Run accuracy benchmark");
+        eprintln!("  index <folder>              Index all files in folder");
+        eprintln!("  search <folder> <query>     Search indexed folder");
+        eprintln!("  benchmark <folder>          Run accuracy benchmark");
+        eprintln!("  serve <folder> [--port N]   Start REST API server");
+        eprintln!("  save <folder> <index.bin>   Save index to binary file");
+        eprintln!("  load <index.bin>            Load index from binary file (interactive)");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  onod benchmark files/");
+        eprintln!("  onod search files/ \"What is revenue?\"");
+        eprintln!("  onod serve files/ --port 8080");
+        eprintln!("  onod save files/ index.bin");
+        eprintln!("  onod load index.bin");
         std::process::exit(1);
     }
 
@@ -382,28 +563,67 @@ fn main() {
                 .filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.'))
                 .collect();
 
-            for (i, path) in paths.iter().enumerate() {
+            eprintln!("Reading {} files in parallel...", paths.len());
+            let results = read_files_parallel(&paths);
+            
+            for (path, result) in &results {
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                eprint!("  [{}/{}] {} ... ", i+1, paths.len(), name);
-                match read_file(path) {
+                match result {
                     Ok(text) => {
-                        let chunks = idx.add_text(&text, &name, 0);
-                        eprintln!("{} chunks", chunks);
+                        let chunks = idx.add_text(text, &name, 0);
+                        eprintln!("  {} -> {} chunks", name, chunks);
                     }
-                    Err(e) => eprintln!("ERROR: {}", e),
+                    Err(e) => eprintln!("  {} -> ERROR: {}", name, e),
                 }
             }
             idx.finalize();
             let elapsed = t0.elapsed();
-            eprintln!("\nIndexed {} files, {} chunks, {} word terms, {} tri terms in {:.2}s",
-                paths.len(), idx.docs.len(), idx.w_post.len(), idx.t_post.len(), elapsed.as_secs_f64());
+            eprintln!("\nIndexed {} files, {} chunks, {:.2}s", 
+                paths.len(), idx.docs.len(), elapsed.as_secs_f64());
         }
+        
         "search" => {
-            let index_dir = args.get(2).expect("provide index dir");
-            let query = args.get(3).expect("provide query");
-            // For now just read from folder directly
-            eprintln!("Search not implemented yet - use benchmark mode");
+            let folder = args.get(2).expect("provide folder");
+            let query = args.get(3..).unwrap_or(&[]).join(" ");
+            if query.is_empty() {
+                eprintln!("Usage: onod search <folder> <query>");
+                std::process::exit(1);
+            }
+
+            let mut idx = OnodIndex::new();
+            let t0 = Instant::now();
+
+            let paths: Vec<PathBuf> = fs::read_dir(folder)
+                .expect("cannot read dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.'))
+                .collect();
+
+            for path in &paths {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if let Ok(text) = read_file(path) {
+                    idx.add_text(&text, &name, 0);
+                }
+            }
+            idx.finalize();
+            
+            let t1 = Instant::now();
+            let results = idx.search(&query, 10);
+            let search_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+            eprintln!("Query: \"{}\"", query);
+            eprintln!("Index: {} chunks in {:.2}s", idx.docs.len(), t0.elapsed().as_secs_f64());
+            eprintln!("Search: {:.1}ms\n", search_ms);
+
+            for (i, r) in results.iter().enumerate() {
+                println!("{}. [{:.4}] {} (page {}) — {}", 
+                    i+1, r.score, r.source, r.page, r.heading);
+                println!("   {}", r.snippet);
+                println!();
+            }
         }
+        
         "benchmark" => {
             let folder = args.get(2).expect("provide folder with documents");
             let mut idx = OnodIndex::new();
@@ -421,22 +641,21 @@ fn main() {
                 })
                 .collect();
 
-            for (i, path) in paths.iter().enumerate() {
+            let results = read_files_parallel(&paths);
+            for (path, result) in &results {
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                eprint!("  [{}/{}] {} ... ", i+1, paths.len(), name);
-                match read_file(path) {
+                match result {
                     Ok(text) => {
                         let chunks = idx.add_text(&text, &name, 0);
-                        eprintln!("{} chunks", chunks);
+                        eprintln!("  {} -> {} chunks", name, chunks);
                     }
-                    Err(e) => eprintln!("ERROR: {}", e),
+                    Err(e) => eprintln!("  {} -> ERROR: {}", name, e),
                 }
             }
             idx.finalize();
             let index_time = t0.elapsed();
             eprintln!("\nIndex: {} chunks, {:.2}s\n", idx.docs.len(), index_time.as_secs_f64());
 
-            // Benchmark queries
             let queries = vec![
                 ("What is the total revenue?", vec!["revenue", "pendapatan"]),
                 ("Siapa saja direksi?", vec!["direksi", "director"]),
@@ -480,6 +699,108 @@ fn main() {
                 println!("FAIL - need tuning");
             }
         }
+        
+        "serve" => {
+            let folder = args.get(2).expect("provide folder");
+            let port: u16 = args.iter().position(|a| a == "--port")
+                .and_then(|i| args.get(i+1))
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8080);
+
+            eprintln!("Building index from {}...", folder);
+            let mut idx = OnodIndex::new();
+            let t0 = Instant::now();
+
+            let paths: Vec<PathBuf> = fs::read_dir(folder)
+                .expect("cannot read dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.'))
+                .collect();
+
+            for path in &paths {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if let Ok(text) = read_file(path) {
+                    idx.add_text(&text, &name, 0);
+                }
+            }
+            idx.finalize();
+            eprintln!("Index ready: {} chunks in {:.2}s", idx.docs.len(), t0.elapsed().as_secs_f64());
+
+            let idx = Arc::new(idx);
+            start_server(idx, port);
+        }
+        
+        "save" => {
+            let folder = args.get(2).expect("provide folder");
+            let save_path = args.get(3).expect("provide output path (e.g., index.bin)");
+            
+            let mut idx = OnodIndex::new();
+            let t0 = Instant::now();
+
+            let paths: Vec<PathBuf> = fs::read_dir(folder)
+                .expect("cannot read dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.'))
+                .collect();
+
+            for path in &paths {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if let Ok(text) = read_file(path) {
+                    idx.add_text(&text, &name, 0);
+                }
+            }
+            idx.finalize();
+            
+            let save_time = t0.elapsed();
+            let save_path = Path::new(save_path);
+            
+            if save_path.extension().map(|e| e.to_str() == Some("json")).unwrap_or(false) {
+                idx.save_json(save_path).expect("failed to save JSON");
+            } else {
+                idx.save(save_path).expect("failed to save binary");
+            }
+            
+            eprintln!("Saved index: {} chunks -> {} ({:.2}s)", 
+                idx.docs.len(), save_path.display(), save_time.as_secs_f64());
+        }
+        
+        "load" => {
+            let load_path = args.get(2).expect("provide index file path");
+            let load_path = Path::new(load_path);
+            
+            eprintln!("Loading index from {}...", load_path.display());
+            let t0 = Instant::now();
+            let idx = OnodIndex::load(load_path).expect("failed to load index");
+            let load_time = t0.elapsed();
+            
+            eprintln!("Loaded: {} chunks, {} word terms, {} tri terms in {:.2}s",
+                idx.docs.len(), idx.w_post.len(), idx.t_post.len(), load_time.as_secs_f64());
+            
+            eprintln!("\nInteractive mode (type 'quit' to exit):");
+            loop {
+                print!("> ");
+                io::stdout().flush().unwrap();
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input).is_err() { break; }
+                let input = input.trim();
+                if input == "quit" || input == "exit" { break; }
+                if input.is_empty() { continue; }
+                
+                let t1 = Instant::now();
+                let results = idx.search(input, 10);
+                let ms = t1.elapsed().as_secs_f64() * 1000.0;
+                
+                for (i, r) in results.iter().enumerate() {
+                    println!("  {}. [{:.4}] {} (page {}) — {}", 
+                        i+1, r.score, r.source, r.page, r.heading);
+                    println!("     {}", r.snippet);
+                }
+                println!("  ({:.1}ms, {} results)\n", ms, results.len());
+            }
+        }
+        
         _ => {
             eprintln!("Unknown command: {}", args[1]);
             std::process::exit(1);
