@@ -29,10 +29,10 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            chunk_chars: 1200,
-            chunk_overlap: 200,
+            chunk_chars: 2400,
+            chunk_overlap: 300,
             min_chunk: 100,
-            hard_split: 1800,
+            hard_split: 3600,
             embedding_dim: 384,
             top_k_candidates: 200,
             top_k_results: 10,
