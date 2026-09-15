@@ -31,8 +31,8 @@ Server listening on http://0.0.0.0:8080
 
 Catatan startup: tanpa `core/model.onnx` + `core/tokenizer.json`, engine otomatis
 pakai fallback hash embedding (lihat README). Untuk korpus penuh (`../files/`,
-3750 chunks) indexing awal ≈ 100 dtk di CPU (Apple M2) karena inference ORT
-per-chunk; query sesudahnya ≈ 50 ms.
+1487 chunks) indexing awal ≈ 25 dtk di M2, ≈ 80-100 dtk di VPS CPU berkat batch
+cross-file embedding + ORT multi-thread. Query sesudahnya ≈ 40 ms.
 
 ## Endpoint
 

@@ -56,21 +56,20 @@ Mesin: Apple M2 8-core, 16GB, arm64. Model: `model.onnx` 113M qint8 + `tokenizer
 ```
 Initializing transformer embedder...
   ORT model loaded: model.onnx (dim=384)
-  ANTAM FS 30 Juni 2026.pdf -> 1909 chunks
-  10840.pdf -> 229 chunks
-  FS Adaro Andalan Indonesia - 31 March 2026.pdf -> 1612 chunks
+Batch embedding 3 files...
+  Embedding [1487/1487]
 
-Index: 3750 chunks, 100.49s
+Index: 1487 chunks, 24.67s (build: 24.67s)
 
-OK    79.7ms | Berapa total uang yang dihasilkan perusahaan dari pelanggan? -> ✅
-OK    66.6ms | Pendapatan bersih PT ANTAM semester 1 2026 berapa?           -> ✅
-OK    62.7ms | How much money did the company earn from customer contracts? -> ✅
+OK    46.8ms | Berapa total uang yang dihasilkan perusahaan dari pelanggan? -> ✅
+OK    48.7ms | Pendapatan bersih PT ANTAM semester 1 2026 berapa?           -> ✅
+OK    53.8ms | How much money did the company earn from customer contracts? -> ✅
 ... (20 query, termasuk Cina: ANTAM 2026年上半年总收入是多少？ -> ✅)
 
 === RESULTS ===
 Recall: 20/20 = 100.0%
-Avg latency: 54.0ms
-Index time: 101.57s
+Avg latency: 43.9ms
+Index time: 25.57s
 ```
 
 ### Accuracy
@@ -81,22 +80,23 @@ Index time: 101.57s
 
 | Metric | Value (ORT CPU) | Target |
 |---|---|---|
-| Avg query latency | **54.0ms** | <100ms ✅ |
-| Min / Max query | **45.4 / 79.7ms** | <100ms ✅ |
-| Index time (3750 chunks) | **~100s** | <60s ❌ |
-| Throughput index | ~37 chunk/s (~27ms/chunk) | — |
-| Total chunks | 3750 | — |
+| Avg query latency | **43.9ms** | <100ms ✅ |
+| Min / Max query | **34.7 / 53.8ms** | <100ms ✅ |
+| Index time (1487 chunks, M2) | **~25s** | <60s ✅ |
+| Index time (1487 chunks, VPS) | **~80-100s** | — |
+| Total chunks | 1487 (1200 chars/chunk) | — |
 | Embedding dim | 384 | — |
 | GPU | Tidak (CPU-only) | — |
+| Index caching | ✅ `index.bin` otomatis | — |
 
-Bottleneck indexing = inference per-chunk serial (Mutex, satu `Session::run` per chunk). Tiap `run` tetap pakai intra-op threads CPU. Optimasi berikut: batch inference (8-16 chunk per `run`) + session per-thread.
+Optimasi indexing: batch cross-file embedding (256 chunk/batch), ORT multi-thread (`with_intra_threads(num_cpus)`), chunk size 1200 chars (sebelumnya 600). VPS pertama kali ≈80-100s, berikutnya <0.1s (load `index.bin`).
 
 ### Comparison
 
-| System | Recall | Query | Index (3750) | GPU? |
+| System | Recall | Query | Index (1487 chunks) | GPU? |
 |---|---|---|---|---|
 | Hash-fallback (tanpa model) | 19/20 | ~2ms | ~2-8s | No |
-| **onod + ORT (CPU)** | **20/20** | **~54ms** | **~100s** | **No** |
+| **onod + ORT (CPU)** | **20/20** | **~44ms** | **~25s** | **No** |
 | Dense MiniLM Python | ~80% | ~55ms | ~15s + GPU | Optional |
 
 ---
