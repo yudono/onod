@@ -20,7 +20,6 @@ struct Config {
     min_chunk: usize,
     hard_split: usize,
     embedding_dim: usize,
-    sparse_dim: usize,
     top_k_candidates: usize,
     top_k_results: usize,
     rerank_weight: f64,
@@ -35,7 +34,6 @@ impl Default for Config {
             min_chunk: 100,
             hard_split: 900,
             embedding_dim: 384,
-            sparse_dim: 30522,
             top_k_candidates: 200,
             top_k_results: 10,
             rerank_weight: 0.6,
@@ -252,13 +250,11 @@ fn for_each_gram_idx(text: &str, dim: usize, mut f: impl FnMut(usize)) {
 struct SparseEmbedder {
     vocab: HashMap<String, u32>,
     idf: HashMap<String, f64>,
-    dim: usize,
 }
 
 impl SparseEmbedder {
     fn new() -> Self {
-        let cfg = get_config();
-        Self { vocab: HashMap::new(), idf: HashMap::new(), dim: cfg.sparse_dim }
+        Self { vocab: HashMap::new(), idf: HashMap::new() }
     }
     
     fn build_vocab(&mut self, texts: &[String]) {
