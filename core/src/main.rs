@@ -154,8 +154,8 @@ impl TransformerEmbedder {
             Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect(),
         };
         let n = encodings.len();
-        // Truncate to 128 tokens — MiniLM max 512, 128 sudah cukup untuk representasi chunk.
-        let max_seq = encodings.iter().map(|e| e.get_ids().len().min(128)).max().unwrap_or(1).max(1);
+        // Truncate to 96 tokens — sweet spot: 3x faster attention than 128, tapi cukup representatif
+        let max_seq = encodings.iter().map(|e| e.get_ids().len().min(96)).max().unwrap_or(1).max(1);
 
         // Build batched arrays [n, max_seq]
         let mut ids_flat: Vec<i64> = Vec::with_capacity(n * max_seq);
@@ -551,13 +551,11 @@ impl OnodIndex {
         n
     }
 
-    /// Build index seluruh file dalam satu batch Session::run().
-    /// 3750 chunks -> 1 inference call (dibagi batch 256 untuk memory).
+    /// Build index: batch embed semua chunks, lalu build sparse+dense index.
     fn build_index_batch(&mut self, file_texts: &[(String, String)], embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, progress: Option<&dyn Fn(usize, usize)>) {
         let cfg = get_config();
-        let mut all_chunks: Vec<(String, String, String)> = Vec::new(); // (content, heading, source)
+        let mut all_chunks: Vec<(String, String, String)> = Vec::new();
 
-        // 1. Chunk semua file
         for (name, text) in file_texts {
             let norm = normalize(text);
             if norm.len() < cfg.min_chunk { continue; }
@@ -570,32 +568,26 @@ impl OnodIndex {
         let total = all_chunks.len();
         if total == 0 { return; }
 
-        // 2. Batch embed semua chunks sekaligus (dibagi batch 256 untuk memory)
-        let batch_size = 1024;
-        let mut all_dense: Vec<Vec<f32>> = Vec::with_capacity(total);
         let has_model = embedder.has_model();
 
-        if has_model {
+        let all_dense: Vec<Vec<f32>> = if has_model {
             if let Ok(mut guard) = embedder.model.lock() {
                 if let Some(ref mut model) = *guard {
-                    for batch_start in (0..total).step_by(batch_size) {
-                        let batch_end = (batch_start + batch_size).min(total);
-                        if let Some(cb) = progress { cb(batch_start + 1, total); }
-                        let texts: Vec<String> = all_chunks[batch_start..batch_end].iter().map(|(c, _, _)| c.clone()).collect();
-                        let embeddings = TransformerEmbedder::embed_batch_static(model, &embedder.tokenizer, &texts, embedder.dim);
-                        all_dense.extend(embeddings);
-                    }
+                    let texts: Vec<String> = all_chunks.iter().map(|(c, _, _)| c.clone()).collect();
+                    if let Some(cb) = progress { cb(1, total); }
+                    let embeddings = TransformerEmbedder::embed_batch_static(model, &embedder.tokenizer, &texts, embedder.dim);
+                    if let Some(cb) = progress { cb(total, total); }
+                    embeddings
                 } else {
-                    all_dense = all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect();
+                    all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect()
                 }
             } else {
-                all_dense = all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect();
+                all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect()
             }
         } else {
-            all_dense = all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect();
-        }
+            all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect()
+        };
 
-        // 3. Build index dari embeddings
         for ci in 0..total {
             let (content, heading, source) = all_chunks[ci].clone();
             let dense_embedding = all_dense[ci].clone();

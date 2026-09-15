@@ -46,10 +46,10 @@ impl Default for Config {
             min_chunk: 100,
             hard_split: 7200,
             embedding_dim: 384,
-            top_k_candidates: 200,
+            top_k_candidates: 400,
             top_k_results: 10,
-            rerank_weight: 0.6,
-            financial_boost: 0.3,
+            rerank_weight: 0.7,
+            financial_boost: 0.4,
         }
     }
 }
