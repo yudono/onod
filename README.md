@@ -79,24 +79,55 @@ Index time: 6.24s
 
 | Metric | Value (ORT CPU) | Target |
 |---|---|---|
-| Avg query latency | **24.8ms** | <100ms ✅ |
-| Min / Max query | **22.1 / 28.4ms** | <100ms ✅ |
-| Index time (639 chunks, M2) | **~10s** | <60s ✅ |
-| Index time (639 chunks, VPS 2-core) | **~30-40s** | <60s ✅ |
-| Total chunks | 639 (2400 chars/chunk) | — |
+| Avg query latency | **25.0ms** | <100ms ✅ |
+| Index time (289 chunks, M2) | **~6s** | <10s ✅ |
+| Index time (289 chunks, VPS 2-core) | **~20s** | <60s ✅ |
+| Total chunks | 289 (4800 chars/chunk) | — |
 | Embedding dim | 384 | — |
 | GPU | Tidak (CPU-only) | — |
 | Index caching | ✅ `index.bin` otomatis | — |
 
-Optimasi indexing: batch cross-file embedding (256 chunk/batch), ORT multi-thread (`with_intra_threads(num_cpus)`), chunk size 2400 chars. VPS pertama kali ≈30-40s, berikutnya <0.1s (load `index.bin`).
+Optimasi indexing: batch cross-file embedding (256 chunk/batch), ORT multi-thread (`with_intra_threads(num_cpus)`), chunk size 4800 chars. VPS pertama kali ≈20s, berikutnya <0.1s (load `index.bin`).
 
 ### Comparison
 
-| System | Recall | Query | Index (639 chunks) | GPU? |
+| System | Recall | Query | Index (289 chunks) | GPU? |
 |---|---|---|---|---|
 | Hash-fallback (tanpa model) | 19/20 | ~2ms | ~2-4s | No |
-| **onod + ORT (CPU)** | **20/20** | **~25ms** | **~10s** | **No** |
+| **onod + ORT (CPU)** | **20/20** | **~25ms** | **~6s** | **No** |
 | Dense MiniLM Python | ~80% | ~55ms | ~15s + GPU | Optional |
+
+---
+
+## Konfigurasi
+
+Buat file `core/onod.json` atau `core/config.json` untuk override default:
+
+```json
+{
+  "chunk_chars": 4800,
+  "chunk_overlap": 400,
+  "min_chunk": 100,
+  "hard_split": 7200,
+  "embedding_dim": 384,
+  "top_k_candidates": 200,
+  "top_k_results": 10,
+  "rerank_weight": 0.6,
+  "financial_boost": 0.3
+}
+```
+
+| Field | Default | Fungsi |
+|---|---|---|
+| `chunk_chars` | 4800 | Karakter per chunk. Besar → fewer chunks → faster indexing, tapi konteks lebih luas |
+| `chunk_overlap` | 400 | Overlap antar chunk (10% dari chunk_chars). Mencegah info di boundary hilang |
+| `min_chunk` | 100 | Minimum karakter agar chunk valid. Yang lebih kecil dibuang |
+| `hard_split` | 7200 | Force split jika chunk melebihi ini (1.5x chunk_chars) |
+| `embedding_dim` | 384 | Dimensi output model. MiniLM = 384 |
+| `top_k_candidates` | 200 | Kandidat dari retrieval sebelum reranking. Besar → lebih lengkap tapi lebih lambat |
+| `top_k_results` | 10 | Hasil akhir yang dikembalikan |
+| `rerank_weight` | 0.6 | Bobot reranker (0.0-1.0). Tinggi → lebih banyak pengaruh reranker |
+| `financial_boost` | 0.3 | Boost skor untuk dokumen dengan istilah keuangan (revenue, laba, aset, dll) |
 
 ---
 
