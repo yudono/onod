@@ -441,14 +441,16 @@ impl OnodIndex {
         Self { docs: Vec::new(), dense_index: Vec::new(), sparse_index: Vec::new(), dim_df: vec![0u32; dim] }
     }
 
-    fn add_text(&mut self, text: &str, source: &str, page: u32, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder) -> u32 {
+    fn add_text(&mut self, text: &str, source: &str, page: u32, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, progress: Option<&dyn Fn(usize, usize)>) -> u32 {
         let norm = normalize(text);
         let cfg = get_config();
         if norm.len() < cfg.min_chunk { return 0; }
         let chunks = chunk_text(&norm);
+        let total = chunks.len();
         let mut n = 0u32;
-        for (content, heading) in chunks {
+        for (ci, (content, heading)) in chunks.into_iter().enumerate() {
             if content.len() < cfg.min_chunk { continue; }
+            if let Some(cb) = progress { cb(ci + 1, total); }
             let dense_embedding = embedder.embed(&content);
             for (i, v) in dense_embedding.iter().enumerate() {
                 if *v > 0.0 {
@@ -700,7 +702,13 @@ fn main() {
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 if let Ok(text) = result {
                     if !text.is_empty() {
-                        let c = idx.add_text(&text, &name, 0, &embedder, &sparse);
+                        let name_c = name.clone();
+                        let c = idx.add_text(&text, &name, 0, &embedder, &sparse, Some(&|cur, tot| {
+                            if cur == 1 || cur == tot || cur % 50 == 0 {
+                                eprint!("\r  {} [{}/{}]", name_c, cur, tot);
+                                if cur == tot { eprintln!(); }
+                            }
+                        }));
                         if c > 0 { eprintln!("  {} -> {} chunks", name, c); }
                     }
                 }
@@ -763,7 +771,7 @@ fn main() {
                 let results = read_files_parallel(&paths);
                 let texts: Vec<String> = results.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
                 sparse.build_vocab(&texts);
-                for (path, result) in &results { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0, &embedder, &sparse); } }
+                for (path, result) in &results { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0, &embedder, &sparse, Some(&|cur, tot| { if cur == 1 || cur == tot || cur % 50 == 0 { eprint!("\r  {} [{}/{}]", name, cur, tot); if cur == tot { eprintln!(); } } })); } }
                 let _ = idx.save(&index_path);
             }
             let t1 = Instant::now(); let results = idx.search(&query, &embedder, &sparse, &reranker, 10); let ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -776,7 +784,7 @@ fn main() {
             eprintln!("Building index..."); let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
             let results = read_files_parallel(&paths); let texts: Vec<String> = results.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
             sparse.build_vocab(&texts);
-            for (path, result) in &results { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0, &embedder, &sparse); } }
+            for (path, result) in &results { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0, &embedder, &sparse, Some(&|cur, tot| { if cur == 1 || cur == tot || cur % 50 == 0 { eprint!("\r  {} [{}/{}]", name, cur, tot); if cur == tot { eprintln!(); } } })); } }
             eprintln!("Index: {} chunks", idx.docs.len());
             let idx = Arc::new(idx);
             let sparse = Arc::new(sparse);
