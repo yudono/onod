@@ -15,7 +15,7 @@
 15. Modal pemegang saham berapa? -> modal, equity, pemegang, saham
 16. Gold production volume? -> emas, gold, production, 14.944
 17. Nickel mining output in tons? -> nikel, nickel, production, ton
-18. Chief executive officer name? -> direksi, director, presiden, direktur
+18. Siapa direktur utama perusahaan? -> direksi, direktur, utama, presiden
 19. Board of directors composition? -> direksi, director, commissioners, board
 20. Dividend payment amount? -> dividen, dividend, payment
 21. Operating cash flow total? -> arus, kas, operasi, cash, flow

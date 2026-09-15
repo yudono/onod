@@ -410,7 +410,7 @@ impl OnodIndex {
             let d = &self.docs[doc as usize];
             let mut expanded = d.content.clone();
             if let Some(nxt) = self.docs.get(doc as usize + 1) { if nxt.source == d.source { expanded.push(' '); expanded.push_str(&nxt.content.chars().take(600).collect::<String>()); } }
-            SearchResult { doc, score, page: d.page, source: d.source.clone(), heading: d.heading.clone(), snippet: d.content.chars().take(300).collect(), expanded: expanded.chars().take(900).collect() }
+            SearchResult { doc, score, page: d.page, source: d.source.clone(), heading: d.heading.clone(), snippet: d.content.chars().take(600).collect(), expanded: expanded.chars().take(2000).collect() }
         }).collect()
     }
 
@@ -446,6 +446,14 @@ fn read_file(path: &Path) -> io::Result<String> {
             if meta.len() > 100 * 1024 * 1024 { read_file_mmap(path) } else { fs::read_to_string(path) }
         }
         "pdf" => {
+            // Always prefer pdftotext (poppler) — better table/layout extraction
+            if let Ok(out) = std::process::Command::new("pdftotext")
+                .arg(path.to_str().unwrap_or("")).arg("-").output() {
+                if out.status.success() && !out.stdout.is_empty() {
+                    return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+                }
+            }
+            // Fallback to pdf_oxide if pdftotext not available
             match pdf_oxide::PdfDocument::open(path.to_str().unwrap_or("")) {
                 Ok(doc) => { let n = doc.page_count().unwrap_or(0); let mut all = String::new(); for i in 0..n { if let Ok(t) = doc.extract_text_auto(i) { all.push_str(&t); all.push_str("\n\n"); } } Ok(all) }
                 Err(e) => { eprintln!("  WARNING: PDF failed: {}", e); Ok(String::new()) }
@@ -706,7 +714,7 @@ fn main() {
                 if let Ok(results) = serde_json::from_str::<Vec<SearchResult>>(parts.get(1).unwrap_or(&"[]")) {
                     eprintln!("\nWorker search: {:.1}ms (roundtrip {:.1}ms)\n", query_ms, ms);
                     for (i, r) in results.iter().enumerate() {
-                        println!("{}. [{:.4}] {} — {}", i+1, r.score, r.heading, r.snippet.chars().take(150).collect::<String>());
+                        println!("{}. [{:.4}] {} — {}", i+1, r.score, r.heading, r.snippet.chars().take(500).collect::<String>());
                     }
                 }
             } else {
