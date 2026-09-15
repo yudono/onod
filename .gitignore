@@ -8,4 +8,8 @@ venv/
 .DS_Store
 *.npz
 *.bin
+*.onnx
+tokenizer.json
+model.tokenizer.json
 core/target/
+paper/_fig/

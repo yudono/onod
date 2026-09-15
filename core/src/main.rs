@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
+use ndarray::Array2;
+use ort::session::{Session, builder::SessionBuilder};
+use ort::value::Value;
 
 // ==================== CONFIG ====================
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -16,19 +19,12 @@ struct Config {
     chunk_overlap: usize,
     min_chunk: usize,
     hard_split: usize,
-    bm25_k1: f64,
-    bm25_b: f64,
-    w_word: f64,
-    w_tri: f64,
-    w_dense: f64,
-    rrf_k: f64,
-    financial_num_threshold: usize,
-    financial_term_threshold: usize,
-    num_boost: f64,
-    financial_boost: f64,
     embedding_dim: usize,
-    dense_weight: f64,
-    sparse_weight: f64,
+    sparse_dim: usize,
+    top_k_candidates: usize,
+    top_k_results: usize,
+    rerank_weight: f64,
+    financial_boost: f64,
 }
 
 impl Default for Config {
@@ -38,19 +34,12 @@ impl Default for Config {
             chunk_overlap: 140,
             min_chunk: 100,
             hard_split: 900,
-            bm25_k1: 1.2,
-            bm25_b: 0.75,
-            w_word: 0.72,
-            w_tri: 0.28,
-            w_dense: 0.50,
-            rrf_k: 60.0,
-            financial_num_threshold: 50,
-            financial_term_threshold: 20,
-            num_boost: 0.3,
-            financial_boost: 0.4,
             embedding_dim: 384,
-            dense_weight: 0.6,
-            sparse_weight: 0.4,
+            sparse_dim: 30522,
+            top_k_candidates: 200,
+            top_k_results: 10,
+            rerank_weight: 0.6,
+            financial_boost: 0.3,
         }
     }
 }
@@ -69,57 +58,291 @@ impl Config {
 static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 fn get_config() -> &'static Config { CONFIG.get_or_init(|| Config::load()) }
 
-// ==================== DENSE EMBEDDING INDEX ====================
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct DenseIndex {
-    embeddings: Vec<Vec<f32>>,
-    doc_ids: Vec<u32>,
+// ==================== TRANSFORMER EMBEDDING ====================
+// ort hook: jika file model.onnx ada dipakai, jika tidak fallback ke hash embedding.
+// Mutex agar &self tetap bisa dipakai paralel via rayon (Session::run butuh &mut).
+struct TransformerEmbedder {
+    model: std::sync::Mutex<Option<Session>>,
+    tokenizer: tokenizers::Tokenizer,
     dim: usize,
 }
 
-impl DenseIndex {
-    fn new(dim: usize) -> Self { Self { embeddings: Vec::new(), doc_ids: Vec::new(), dim } }
-    
-    fn add(&mut self, doc_id: u32, embedding: Vec<f32>) {
-        self.embeddings.push(embedding);
-        self.doc_ids.push(doc_id);
+impl TransformerEmbedder {
+    fn new() -> Self {
+        let cfg = get_config();
+        // Load tokenizer.json asli (Unigram 250k). Fallback ke WordPiece kosong hanya jika file hilang.
+        let tokenizer = tokenizers::Tokenizer::from_file("model.tokenizer.json")
+            .or_else(|_| tokenizers::Tokenizer::from_file("tokenizer.json"))
+            .unwrap_or_else(|e| {
+                eprintln!("  WARNING: tokenizer.json gagal dimuat ({}), fallback hash embedding", e);
+                tokenizers::Tokenizer::new(tokenizers::models::wordpiece::WordPiece::default())
+            });
+
+        let model = SessionBuilder::new()
+            .and_then(|mut b| b.commit_from_file("model.onnx"))
+            .map_err(|e| {
+                eprintln!("  WARNING: model.onnx gagal dimuat ({}), fallback hash embedding", e);
+                e
+            })
+            .ok();
+
+        if model.is_some() {
+            eprintln!("  ORT model loaded: model.onnx (dim={})", cfg.embedding_dim);
+        } else {
+            eprintln!("  ORT model TIDAK ada: pakai hash embedding (dim={})", cfg.embedding_dim);
+        }
+
+        Self { model: std::sync::Mutex::new(model), tokenizer, dim: cfg.embedding_dim }
+    }
+
+    fn has_model(&self) -> bool {
+        self.model.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    fn embed(&self, text: &str) -> Vec<f32> {
+        // Encode dulu di luar lock (tokenizer &self, thread-safe untuk rayon).
+        let encoding = match self.tokenizer.encode(text, true) {
+            Ok(enc) => enc,
+            Err(_) => return self.embed_hash(text),
+        };
+        if encoding.len() == 0 {
+            return self.embed_hash(text);
+        }
+        if let Ok(mut guard) = self.model.lock() {
+            if let Some(ref mut model) = *guard {
+                if let Some(v) = Self::embed_with_model_static(model, &encoding, self.dim) {
+                    return v;
+                }
+            }
+        }
+        self.embed_hash(text)
+    }
+
+    /// Query-side: jika model ada pakai model (konsisten dengan doc-side),
+    /// jika tidak pakai varian hash+IDF.
+    fn embed_query(&self, text: &str, dim_df: &[u32], n_docs: usize) -> Vec<f32> {
+        if self.has_model() {
+            return self.embed(text);
+        }
+        self.embed_hash_idf(text, dim_df, n_docs)
+    }
+
+    fn embed_with_model_static(model: &mut Session, encoding: &tokenizers::Encoding, dim: usize) -> Option<Vec<f32>> {
+        let ids = encoding.get_ids();
+        let mask = encoding.get_attention_mask();
+        if ids.is_empty() { return None; }
+        let seq_len = ids.len();
+        let input_ids: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
+        let attention_mask: Vec<i64> = mask.iter().map(|&x| x as i64).collect();
+        let token_type_ids: Vec<i64> = vec![0i64; seq_len];
+
+        let input_ids_array = Array2::from_shape_vec((1, seq_len), input_ids).ok()?;
+        let attention_mask_array = Array2::from_shape_vec((1, seq_len), attention_mask).ok()?;
+        let token_type_ids_array = Array2::from_shape_vec((1, seq_len), token_type_ids).ok()?;
+
+        let input_ids_value = Value::from_array(input_ids_array.into_dyn()).ok()?;
+        let attention_mask_value = Value::from_array(attention_mask_array.into_dyn()).ok()?;
+        let token_type_ids_value = Value::from_array(token_type_ids_array.into_dyn()).ok()?;
+
+        let outputs = model.run(ort::inputs![
+            "input_ids" => input_ids_value,
+            "attention_mask" => attention_mask_value,
+            "token_type_ids" => token_type_ids_value
+        ]).ok()?;
+
+        // last_hidden_state: [1, seq_len, hidden] -> mean pooling pakai attention_mask + L2 norm
+        let (shape, data) = outputs[0].try_extract_tensor::<f32>().ok()?;
+        let shape: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+        if shape.len() != 3 { return None; }
+        let hidden = shape[2];
+        if data.len() < seq_len * hidden { return None; }
+        let mask_f: Vec<f32> = mask.iter().map(|&x| x as f32).collect();
+        let mask_sum: f32 = mask_f.iter().sum::<f32>().max(1.0);
+        let mut pooled = vec![0.0f32; hidden];
+        for i in 0..seq_len {
+            let m = mask_f[i];
+            if m == 0.0 { continue; }
+            let base = i * hidden;
+            for h in 0..hidden {
+                pooled[h] += data[base + h] * m;
+            }
+        }
+        for v in &mut pooled { *v /= mask_sum; }
+        // L2 normalize
+        let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 { for v in &mut pooled { *v /= norm; } }
+        // Sesuaikan ke dim config (model 384 == default 384; truncate/pad jika beda)
+        if pooled.len() == dim {
+            Some(pooled)
+        } else if pooled.len() > dim {
+            pooled.truncate(dim);
+            Some(pooled)
+        } else {
+            pooled.resize(dim, 0.0);
+            Some(pooled)
+        }
     }
     
-    fn search(&self, query: &[f32], top_k: usize) -> Vec<(u32, f64)> {
-        if self.embeddings.is_empty() { return Vec::new(); }
-        let mut scores: Vec<(u32, f64)> = self.embeddings.iter().zip(self.doc_ids.iter())
-            .map(|(emb, &doc_id)| (doc_id, cosine_similarity(query, emb)))
-            .collect();
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores.truncate(top_k);
-        scores
-    }
-    
-    fn save(&self, path: &Path) -> io::Result<()> {
-        let data = serde_json::json!({
-            "dim": self.dim,
-            "embeddings": self.embeddings,
-            "doc_ids": self.doc_ids,
+    fn embed_hash(&self, text: &str) -> Vec<f32> {
+        // Char n-gram embedding ala fastText via helper terpusat.
+        let mut embedding = vec![0.0f32; self.dim];
+        let mut ngram_count = 0usize;
+        for_each_gram_idx(text, self.dim, |idx| {
+            embedding[idx] += 1.0;
+            ngram_count += 1;
         });
-        fs::write(path, serde_json::to_string(&data)?)
+        if ngram_count == 0 { return embedding; }
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 { for x in &mut embedding { *x /= norm; } }
+        embedding
     }
-    
-    fn load(path: &Path) -> io::Result<Self> {
-        let data: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-        let dim = data["dim"].as_u64().unwrap_or(384) as usize;
-        let embeddings = data["embeddings"].as_array().unwrap().iter()
-            .map(|e| e.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect())
-            .collect();
-        let doc_ids = data["doc_ids"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as u32).collect();
-        Ok(Self { embeddings, doc_ids, dim })
+
+    fn embed_hash_idf(&self, text: &str, dim_df: &[u32], n_docs: usize) -> Vec<f32> {
+        // Varian query-side: abaikan gram yang df=0 (tak matchible di korpus,
+        // hanya noise — mis. CJK pada korpus Latin) + bobot IDF.
+        // Ini IDF standar, bukan hardcode bahasa.
+        let mut embedding = vec![0.0f32; self.dim];
+        let mut ngram_count = 0usize;
+        let n = n_docs.max(1) as f64;
+        for_each_gram_idx(text, self.dim, |idx| {
+            let df = dim_df.get(idx).copied().unwrap_or(0);
+            if df == 0 { return; }
+            let idf = ((n - df as f64 + 0.5) / (df as f64 + 0.5) + 1.0).ln() as f32;
+            embedding[idx] += idf;
+            ngram_count += 1;
+        });
+        if ngram_count == 0 { return embedding; }
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 { for x in &mut embedding { *x /= norm; } }
+        embedding
+    }
+
+}
+
+/// Satu-satunya tempat logika gram→dim. Dipakai index-time & query-time
+/// agar konsisten. Tanpa alokasi String per gram.
+fn for_each_gram_idx(text: &str, dim: usize, mut f: impl FnMut(usize)) {
+    for word in text.split_whitespace() {
+        let lower = word.to_lowercase();
+        let chars: Vec<char> = lower.chars().collect();
+        if chars.len() < 3 { continue; }
+        // bungkus #...# secara virtual via index
+        for n in 3..=5 {
+            if chars.len() + 2 < n { continue; }
+            for i in 0..=(chars.len() + 2 - n) {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for j in 0..n {
+                    let c = if i == 0 && j == 0 {
+                        '#' as u32
+                    } else if i + j == chars.len() + 1 {
+                        '#' as u32
+                    } else {
+                        chars[i + j - 1] as u32
+                    };
+                    h ^= c as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                f((h % dim as u64) as usize);
+            }
+        }
     }
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    let mut dot = 0.0; let mut na = 0.0; let mut nb = 0.0;
-    for i in 0..a.len().min(b.len()) { dot += a[i] as f64 * b[i] as f64; na += a[i] as f64 * a[i] as f64; nb += b[i] as f64 * b[i] as f64; }
-    let norm = na.sqrt() * nb.sqrt();
-    if norm > 0.0 { dot / norm } else { 0.0 }
+// ==================== SPARSE TEXT EMBEDDING ====================
+struct SparseEmbedder {
+    vocab: HashMap<String, u32>,
+    idf: HashMap<String, f64>,
+    dim: usize,
+}
+
+impl SparseEmbedder {
+    fn new() -> Self {
+        let cfg = get_config();
+        Self { vocab: HashMap::new(), idf: HashMap::new(), dim: cfg.sparse_dim }
+    }
+    
+    fn build_vocab(&mut self, texts: &[String]) {
+        let mut tf: HashMap<String, usize> = HashMap::new();
+        let mut df: HashMap<String, usize> = HashMap::new();
+        let n = texts.len() as f64;
+        
+        for text in texts {
+            let words: HashSet<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
+            for word in &words {
+                *tf.entry(word.clone()).or_insert(0) += 1;
+                *df.entry(word.clone()).or_insert(0) += 1;
+            }
+        }
+        
+        // Build vocab dengan frequency threshold
+        for (word, &count) in &tf {
+            if count >= 2 && word.len() > 2 {
+                let idx = self.vocab.len() as u32;
+                self.vocab.insert(word.clone(), idx);
+            }
+        }
+        
+        // Compute IDF
+        for (word, &df_val) in &df {
+            self.idf.insert(word.clone(), (n / (df_val as f64 + 1.0)).ln());
+        }
+    }
+    
+    fn embed(&self, text: &str) -> HashMap<u32, f32> {
+        // Sparse sejati: hanya dimensi non-zero yang disimpan.
+        // 3750 docs × ~100 terms ≈ 375rb entri (vs 114jt dense) → hemat ~300x.
+        let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
+        let mut sparse: HashMap<u32, f32> = HashMap::new();
+
+        for word in &words {
+            if let Some(&idx) = self.vocab.get(word) {
+                *sparse.entry(idx).or_insert(0.0) += *self.idf.get(word).unwrap_or(&1.0) as f32;
+            }
+        }
+
+        // L2 normalize
+        let norm: f32 = sparse.values().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 { for x in sparse.values_mut() { *x /= norm; } }
+        sparse
+    }
+
+    fn sparse_cosine(a: &HashMap<u32, f32>, b: &HashMap<u32, f32>) -> f64 {
+        if a.is_empty() || b.is_empty() { return 0.0; }
+        let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        let mut dot = 0.0;
+        for (k, v) in small {
+            if let Some(w) = big.get(k) { dot += *v as f64 * *w as f64; }
+        }
+        dot // vektor sudah ternormalisasi
+    }
+
+}
+
+// ==================== RERANKER ====================
+// Rerank murah tanpa re-embed: memadukan skor fusion dengan cosine
+// query_dense vs dense embedding tersimpan.
+struct Reranker;
+
+impl Reranker {
+    fn new() -> Self { Self }
+    
+    fn rerank(&self, query_dense: &[f32], candidates: &[SearchResult], docs: &[Doc], top_k: usize) -> Vec<SearchResult> {
+        // Rerank murah: cosine antara query_dense (sudah dihitung sekali)
+        // dengan dense embedding tersimpan tiap kandidat. Tanpa re-embed.
+        let mut scored: Vec<(usize, f64)> = candidates.iter().enumerate().map(|(i, c)| {
+            let sim = cosine_similarity(query_dense, &docs[c.doc as usize].dense_embedding);
+            (i, 0.5 * c.score + 0.5 * sim)
+        }).collect();
+        
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        
+        scored.into_iter().map(|(i, score)| {
+            let mut r = candidates[i].clone();
+            r.score = score;
+            r
+        }).collect()
+    }
 }
 
 // ==================== NORMALIZATION ====================
@@ -135,72 +358,6 @@ fn normalize(raw: &str) -> String {
     }
     if prev_space { out.pop(); }
     out
-}
-#[inline]
-fn is_thousands(tok: &str) -> bool {
-    let b = tok.as_bytes();
-    let mut i = 0; let mut head = 0;
-    while i < b.len() && b[i].is_ascii_digit() && head < 3 { i += 1; head += 1; }
-    if head == 0 || head > 3 { return false; }
-    let mut groups = 0;
-    while i + 4 <= b.len() && b[i] == b'.' && b[i+1].is_ascii_digit() && b[i+2].is_ascii_digit() && b[i+3].is_ascii_digit() { i += 4; groups += 1; }
-    if groups == 0 { return false; }
-    if i < b.len() && b[i] == b',' { i += 1; let s = i; while i < b.len() && b[i].is_ascii_digit() { i += 1; } if i == s { return false; } }
-    i == b.len()
-}
-
-// ==================== TOKENIZER ====================
-fn tokenize_words_lower(low: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let chars: Vec<char> = low.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_ascii_digit() {
-            let mut j = i; let mut head = 0;
-            while j < chars.len() && chars[j].is_ascii_digit() && head < 3 { j += 1; head += 1; }
-            let mut k = j; let mut groups = 0;
-            while k+4 <= chars.len() && chars[k]=='.' && chars[k+1].is_ascii_digit() && chars[k+2].is_ascii_digit() && chars[k+3].is_ascii_digit() { k+=4; groups+=1; }
-            if groups > 0 {
-                let mut kk = k;
-                if kk < chars.len() && chars[kk] == ',' { kk+=1; let s=kk; while kk<chars.len() && chars[kk].is_ascii_digit(){kk+=1;} if kk>s{k=kk;} }
-                if k>=chars.len() || !chars[k].is_alphanumeric() { words.push(chars[i..k].iter().collect()); i=k; continue; }
-            }
-            let mut j2 = i;
-            while j2<chars.len() && chars[j2].is_alphanumeric(){j2+=1;}
-            let t: String = chars[i..j2].iter().collect();
-            if t.len() > 1 || t.chars().all(|x| x.is_alphanumeric()) { words.push(t); }
-            i = j2;
-        } else if c.is_alphanumeric() {
-            let mut j = i;
-            while j<chars.len() && chars[j].is_alphanumeric(){j+=1;}
-            let t: String = chars[i..j].iter().collect();
-            if t.len() > 1 || t.chars().all(|x| x.is_alphanumeric()) { words.push(t); }
-            i = j;
-        } else { i += 1; }
-    }
-    words
-}
-
-fn trigrams_of(words: &[String], out: &mut Vec<String>) {
-    for w in words {
-        if w.chars().count() < 4 || is_thousands(w) { continue; }
-        let p = format!("#{}#", w);
-        let pc: Vec<char> = p.chars().collect();
-        for i in 0..pc.len().saturating_sub(2) { out.push(pc[i..i+3].iter().collect()); }
-    }
-}
-
-fn analyze_text(norm: &str) -> (Vec<String>, Vec<String>) {
-    let sw: HashSet<&str> = ["the","a","an","is","are","was","were","be","been","being","have","has","had","do","does","did","will","would","shall","should","may","might","must","can","could","of","in","to","for","with","on","at","from","by","about","as","into","through","during","before","after","above","below","between","out","off","over","under","again","further","then","once","here","there","when","where","why","how","all","both","each","few","more","most","other","some","such","no","nor","not","only","own","same","so","than","too","very","just","because","but","and","or","if","while","although","though","since","until","unless","bagaimana","siapa","apa","berapa","kapan","dimana","mengapa","tolong","jelaskan","sebutkan","tunjukkan","berikan"].iter().cloned().collect();
-    let low = norm.to_lowercase();
-    let words = tokenize_words_lower(&low);
-    let base: Vec<String> = words.iter().filter(|w| !sw.contains(w.as_str())).cloned().collect();
-    let mut lex = base.clone();
-    for p in base.windows(2) { if p[0].len()>2 && p[1].len()>2 { lex.push(format!("{}_{}",p[0],p[1])); } }
-    let mut tri = Vec::new();
-    trigrams_of(&words, &mut tri);
-    (lex, tri)
 }
 
 // ==================== CHUNKING ====================
@@ -251,7 +408,10 @@ fn chunk_text(text: &str) -> Vec<(String, String)> {
     let mut buf_len = 0usize;
     let mut heading = String::new();
     for s in sentences {
-        if is_heading(&s) { heading = s.trim_start_matches(['#',' ']).to_string(); if heading.len()>120{heading.truncate(120);} }
+        if is_heading(&s) {
+            let h: String = s.trim_start_matches(['#',' ']).chars().take(120).collect();
+            heading = h;
+        }
         if buf_len + s.len() + 1 > cfg.chunk_chars && !buf.is_empty() {
             let content = buf.join(" ");
             if content.len() >= cfg.min_chunk { chunks.push((content, heading.clone())); }
@@ -267,148 +427,147 @@ fn chunk_text(text: &str) -> Vec<(String, String)> {
 
 // ==================== INDEX ====================
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct Doc { content: String, source: String, page: u32, heading: String, embedding: Option<Vec<f32>> }
+struct Doc { content: String, source: String, page: u32, heading: String, dense_embedding: Vec<f32>, sparse_embedding: HashMap<u32, f32> }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct OnodIndex {
     docs: Vec<Doc>,
-    w_post: HashMap<String, Vec<(u32,u32)>>,
-    t_post: HashMap<String, Vec<(u32,u32)>>,
-    w_len: Vec<usize>,
-    t_len: Vec<usize>,
-    w_idf: HashMap<String, f64>,
-    t_idf: HashMap<String, f64>,
-    w_avg: f64,
-    t_avg: f64,
-    dense_index: DenseIndex,
+    dense_index: Vec<Vec<f32>>,
+    sparse_index: Vec<HashMap<u32, f32>>,
+    /// Doc-frequency per hashed gram dim (ukuran = embedding_dim).
+    /// Dipakai query-side untuk skip gram tak-matchible + bobot IDF.
+    dim_df: Vec<u32>,
 }
 
 impl OnodIndex {
     fn new() -> Self {
-        let cfg = get_config();
-        Self { docs:Vec::new(), w_post:HashMap::new(), t_post:HashMap::new(), w_len:Vec::new(), t_len:Vec::new(), w_idf:HashMap::new(), t_idf:HashMap::new(), w_avg:0.0, t_avg:0.0, dense_index: DenseIndex::new(cfg.embedding_dim) }
+        let dim = get_config().embedding_dim;
+        Self { docs: Vec::new(), dense_index: Vec::new(), sparse_index: Vec::new(), dim_df: vec![0u32; dim] }
     }
 
-    fn finalize(&mut self) {
-        let n = self.docs.len();
-        if n==0{return;}
-        self.w_avg = self.w_len.iter().sum::<usize>() as f64 / n as f64;
-        self.t_avg = self.t_len.iter().sum::<usize>() as f64 / n as f64;
-        let mut wi = HashMap::with_capacity(self.w_post.len());
-        for (t,v) in &self.w_post { let df=v.len() as f64; wi.insert(t.clone(), ((n as f64-df+0.5)/(df+0.5)+1.0).ln()); }
-        let mut ti = HashMap::with_capacity(self.t_post.len());
-        for (t,v) in &self.t_post { let df=v.len() as f64; ti.insert(t.clone(), ((n as f64-df+0.5)/(df+0.5)+1.0).ln()); }
-        self.w_idf = wi; self.t_idf = ti;
-    }
-
-    fn add_text(&mut self, text: &str, source: &str, page: u32) -> u32 {
+    fn add_text(&mut self, text: &str, source: &str, page: u32, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder) -> u32 {
         let norm = normalize(text);
         let cfg = get_config();
         if norm.len() < cfg.min_chunk { return 0; }
         let chunks = chunk_text(&norm);
-        let analyzed: Vec<_> = chunks.into_par_iter().map(|(c,h)|{ let (lex,tri) = analyze_text(&c); (c,h,lex,tri) }).collect();
         let mut n = 0u32;
-        for (content,heading,lex,tri) in analyzed {
-            if lex.is_empty() && tri.is_empty(){continue;}
-            let id = self.docs.len() as u32;
-            let embedding = simple_hash_embedding(&content, cfg.embedding_dim);
-            self.docs.push(Doc{content,source:source.to_string(),page,heading,embedding:Some(embedding.clone())});
-            self.dense_index.add(id, embedding);
-            self.w_len.push(lex.len()); self.t_len.push(tri.len());
-            let mut tf:HashMap<&str,u32> = HashMap::new();
-            for t in &lex{*tf.entry(t.as_str()).or_insert(0)+=1;}
-            for (t,f) in tf{self.w_post.entry(t.to_string()).or_default().push((id,f));}
-            let mut tf2:HashMap<&str,u32> = HashMap::new();
-            for t in &tri{*tf2.entry(t.as_str()).or_insert(0)+=1;}
-            for (t,f) in tf2{self.t_post.entry(t.to_string()).or_default().push((id,f));}
-            n+=1;
+        for (content, heading) in chunks {
+            if content.len() < cfg.min_chunk { continue; }
+            let dense_embedding = embedder.embed(&content);
+            for (i, v) in dense_embedding.iter().enumerate() {
+                if *v > 0.0 {
+                    if i >= self.dim_df.len() { self.dim_df.resize(i + 1, 0); }
+                    self.dim_df[i] += 1;
+                }
+            }
+            let sparse_embedding = sparse_embedder.embed(&content);
+            self.docs.push(Doc { content, source: source.to_string(), page, heading, dense_embedding: dense_embedding.clone(), sparse_embedding: sparse_embedding.clone() });
+            self.dense_index.push(dense_embedding);
+            self.sparse_index.push(sparse_embedding);
+            n += 1;
         }
         n
     }
 
-    fn bm25(qtokens: &[String], post: &HashMap<String,Vec<(u32,u32)>>, idf: &HashMap<String,f64>, lens: &[usize], avg: f64, top_k: usize) -> Vec<(u32,f64)> {
+    fn search(&self, query: &str, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, reranker: &Reranker, top_k: usize) -> Vec<SearchResult> {
+        if self.docs.is_empty() || query.trim().is_empty() { return Vec::new(); }
         let cfg = get_config();
-        let mut qtf: HashMap<&str,u32> = HashMap::new();
-        for t in qtokens{*qtf.entry(t.as_str()).or_insert(0)+=1;}
-        let mut acc: HashMap<u32,f64> = HashMap::new();
-        let mut matched: HashMap<u32,u32> = HashMap::new();
-        for (t,qf) in &qtf {
-            let plist = match post.get(*t){Some(v)=>v,None=>continue,};
-            let idfv = match idf.get(*t){Some(v)=>*v,None=>continue,};
-            if idfv<=0.0{continue;}
-            for chunk in plist.chunks(8) {
-                let chunk_len = chunk.len();
-                let mut batch_dl: [f64; 8] = [avg; 8];
-                let mut batch_tf: [f64; 8] = [0.0; 8];
-                let mut batch_doc: [u32; 8] = [0; 8];
-                for (i, (doc_id, tf)) in chunk.iter().enumerate() { batch_doc[i] = *doc_id; batch_dl[i] = lens.get(*doc_id as usize).copied().unwrap_or(avg as usize) as f64; batch_tf[i] = *tf as f64; }
-                let k1_plus_1 = cfg.bm25_k1 + 1.0; let one_minus_b = 1.0 - cfg.bm25_b; let inv_avg = 1.0 / avg.max(1.0);
-                let mut batch_scores: [f64; 8] = [0.0; 8];
-                for i in 0..chunk_len { let norm = one_minus_b + cfg.bm25_b * batch_dl[i] * inv_avg; let denom = batch_tf[i] + cfg.bm25_k1 * norm; batch_scores[i] = if denom > 0.0 { idfv * (batch_tf[i] * k1_plus_1 / denom) } else { 0.0 }; }
-                let nq = qtf.len().max(1) as f64;
-                for i in 0..chunk_len { let score = batch_scores[i]; if score > 0.0 { let m = matched.entry(batch_doc[i]).or_insert(0); *m += 1; let cov = *m as f64 / nq; let bonus = if (*m as f64 - nq).abs() < 1e-9 { 0.5 } else { 0.0 }; *acc.entry(batch_doc[i]).or_insert(0.0) += score * (0.4 + 0.6 * cov + bonus) * (1.0 + 0.1 * (*qf as f64 - 1.0)); } }
-            }
-        }
-        if acc.is_empty(){return Vec::new();}
-        let mut scored: Vec<(u32,f64)> = acc.into_iter().collect();
-        let k = top_k.min(scored.len());
-        if k == 0 { return scored; }
-        scored.select_nth_unstable_by(k-1,|a,b|b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        scored.sort_by(|a,b|b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored
-    }
+        
+        // 1. Dense retrieval (embedding similarity) — paralel 8-core.
+        // Jika ORT model ada: query & doc sama-sama transformer embedding.
+        // Jika tidak: query pakai varian IDF (skip gram df=0).
+        let query_dense = embedder.embed_query(query, &self.dim_df, self.docs.len());
+        let dense_scores: Vec<(u32, f64)> = self.dense_index.par_iter().enumerate().map(|(i, emb)| {
+            (i as u32, cosine_similarity(&query_dense, emb))
+        }).collect();
 
-    fn hybrid_search(&self, query: &str, top_k: usize) -> Vec<SearchResult> {
-        if self.docs.is_empty()||query.trim().is_empty(){return Vec::new();}
-        let cfg = get_config();
-        let sw: HashSet<&str> = ["the","a","an","is","are","was","were","be","been","being","have","has","had","do","does","did","will","would","shall","should","may","might","must","can","could","of","in","to","for","with","on","at","from","by","about","as","into","through","during","before","after","above","below","between","out","off","over","under","again","further","then","once","here","there","when","where","why","how","all","both","each","few","more","most","other","some","such","no","nor","not","only","own","same","so","than","too","very","just","because","but","and","or","if","while","although","though","since","until","unless","bagaimana","siapa","apa","berapa","kapan","dimana","mengapa","tolong","jelaskan","sebutkan","tunjukkan","berikan"].iter().cloned().collect();
-        
-        // 1. Sparse search (BM25 word + trigram)
-        let norm = normalize(query);
-        let low = norm.to_lowercase();
-        let words = tokenize_words_lower(&low);
-        let base: Vec<String> = words.iter().filter(|w|!sw.contains(w.as_str())).cloned().collect();
-        let mut lex = base.clone();
-        for p in base.windows(2){if p[0].len()>2&&p[1].len()>2{lex.push(format!("{}_{}",p[0],p[1]));}}
-        let mut tri = Vec::new();
-        trigrams_of(&words,&mut tri);
-        let wr = Self::bm25(&lex,&self.w_post,&self.w_idf,&self.w_len,self.w_avg,200);
-        let tr = Self::bm25(&tri,&self.t_post,&self.t_idf,&self.t_len,self.t_avg,200);
-        
-        // 2. Dense search (embedding similarity)
-        let query_embedding = simple_hash_embedding(&query, cfg.embedding_dim);
-        let dense_results = self.dense_index.search(&query_embedding, 200);
+        // 2. Sparse retrieval (intersect non-zero dims — cepat, tanpa scan 30k dim) — paralel 8-core
+        let query_sparse = sparse_embedder.embed(query);
+        let sparse_scores: Vec<(u32, f64)> = self.sparse_index.par_iter().enumerate().map(|(i, emb)| {
+            (i as u32, SparseEmbedder::sparse_cosine(&query_sparse, emb))
+        }).collect();
         
         // 3. Hybrid fusion (RRF)
-        let mut acc: HashMap<u32,f64> = HashMap::new();
-        for (rank,(doc,_)) in wr.iter().enumerate(){*acc.entry(*doc).or_insert(0.0)+=cfg.w_word/(cfg.rrf_k+rank as f64+1.0);}
-        for (rank,(doc,_)) in tr.iter().enumerate(){*acc.entry(*doc).or_insert(0.0)+=cfg.w_tri/(cfg.rrf_k+rank as f64+1.0);}
-        for (rank,(doc,_)) in dense_results.iter().enumerate(){*acc.entry(*doc).or_insert(0.0)+=cfg.w_dense/(cfg.rrf_k+rank as f64+1.0);}
+        let mut acc: HashMap<u32, f64> = HashMap::new();
+        let rrf_k = 60.0;
         
-        // 4. Boosts
-        let qnums: HashSet<&str> = lex.iter().filter(|t|is_thousands(t)).map(|s|s.as_str()).collect();
-        let mut fused: Vec<(u32,f64)> = acc.into_iter().collect();
-        if !qnums.is_empty(){for(doc,s) in fused.iter_mut(){let c=&self.docs[*doc as usize].content;for qn in &qnums{if c.contains(*qn){*s+=0.6;break;}}}}
+        // Sort dense scores
+        let mut dense_sorted = dense_scores.clone();
+        dense_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (rank, (doc, _)) in dense_sorted.iter().enumerate() {
+            *acc.entry(*doc).or_insert(0.0) += 0.6 / (rrf_k + rank as f64 + 1.0);
+        }
+        
+        // Sort sparse scores
+        let mut sparse_sorted = sparse_scores.clone();
+        sparse_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (rank, (doc, _)) in sparse_sorted.iter().enumerate() {
+            *acc.entry(*doc).or_insert(0.0) += 0.4 / (rrf_k + rank as f64 + 1.0);
+        }
+        
+        // 4. Financial boost
         let fin_terms: HashSet<&str> = ["revenue","income","pendapatan","profit","laba","assets","aset","liabilitas","utang","equity","ekuitas","modal","dividen","dividend","arus","kas","cash","penjualan","sales","beban","cost","expense","tax","pajak","emas","gold","nikel","nickel","bauksit","bauxite"].iter().cloned().collect();
-        for(doc,s) in fused.iter_mut(){let c = self.docs[*doc as usize].content.to_lowercase();let nc=c.matches(|c:char|c.is_ascii_digit()).count();if nc>cfg.financial_num_threshold{*s+=cfg.num_boost;}let hf=fin_terms.iter().any(|t|c.contains(t));if hf&&nc>cfg.financial_term_threshold{*s+=cfg.financial_boost;}}
+        let mut fused: Vec<(u32, f64)> = acc.into_iter().collect();
+        for (doc, s) in fused.iter_mut() {
+            let c = self.docs[*doc as usize].content.to_lowercase();
+            let nc = c.matches(|c: char| c.is_ascii_digit()).count();
+            let hf = fin_terms.iter().any(|t| c.contains(t));
+            if hf && nc > 20 { *s += cfg.financial_boost; }
+        }
         
-        // 5. Rerank with dense similarity boost
-        for(doc,s) in fused.iter_mut(){
-            if let Some(emb) = &self.docs[*doc as usize].embedding {
-                let dense_sim = cosine_similarity(&query_embedding, emb);
-                *s += dense_sim * cfg.dense_weight;
+        // 5. Sort and take top candidates
+        fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        fused.truncate(cfg.top_k_candidates);
+
+        // 5b. Trigram-overlap boost pada kandidat (char-level, typo/morfologi).
+        // Murah karena hanya top-K kandidat, bukan full corpus.
+        {
+            let qlow = query.to_lowercase();
+            let qw: Vec<String> = qlow.split_whitespace().map(|s| s.to_string()).collect();
+            let mut qset: HashSet<String> = HashSet::new();
+            for w in &qw {
+                if w.chars().count() < 4 { continue; }
+                let p = format!("#{}#", w);
+                let pc: Vec<char> = p.chars().collect();
+                for i in 0..pc.len().saturating_sub(2) { qset.insert(pc[i..i+3].iter().collect()); }
+            }
+            if !qset.is_empty() {
+                for (doc, s) in fused.iter_mut() {
+                    let c = self.docs[*doc as usize].content.to_lowercase();
+                    let mut hit = 0usize;
+                    let mut tot = 0usize;
+                    for w in c.split_whitespace().take(120) {
+                        if w.chars().count() < 4 { continue; }
+                        let p = format!("#{}#", w);
+                        let pc: Vec<char> = p.chars().collect();
+                        for i in 0..pc.len().saturating_sub(2) {
+                            tot += 1;
+                            let g: String = pc[i..i+3].iter().collect();
+                            if qset.contains(&g) { hit += 1; }
+                        }
+                        if tot > 400 { break; }
+                    }
+                    if tot > 0 {
+                        let overlap = hit as f64 / (qset.len() + tot) as f64;
+                        *s += overlap * 2.0;
+                    }
+                }
+                fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             }
         }
         
-        fused.sort_by(|a,b|b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        fused.truncate(top_k);
-        fused.into_iter().map(|(doc,score)|{
+        // 6. Convert to SearchResult
+        let candidates: Vec<SearchResult> = fused.into_iter().map(|(doc, score)| {
             let d = &self.docs[doc as usize];
-            let mut expanded_content = d.content.clone();
-            if let Some(nxt) = self.docs.get(doc as usize + 1) { if nxt.source == d.source { expanded_content.push(' '); expanded_content.push_str(&nxt.content.chars().take(600).collect::<String>()); } }
-            SearchResult { doc, score, page: d.page, source: d.source.clone(), heading: d.heading.clone(), snippet: d.content.chars().take(300).collect(), expanded: expanded_content.chars().take(900).collect() }
-        }).collect()
+            let mut expanded = d.content.clone();
+            if let Some(nxt) = self.docs.get(doc as usize + 1) {
+                if nxt.source == d.source { expanded.push(' '); expanded.push_str(&nxt.content.chars().take(600).collect::<String>()); }
+            }
+            SearchResult { doc, score, page: d.page, source: d.source.clone(), heading: d.heading.clone(), snippet: d.content.chars().take(300).collect(), expanded: expanded.chars().take(900).collect() }
+        }).collect();
+        
+        // 7. Rerank dengan dense embedding tersimpan (tanpa re-embed)
+        reranker.rerank(&query_dense, &candidates, &self.docs, top_k)
     }
 
     fn save(&self, path: &Path) -> io::Result<()> {
@@ -416,6 +575,7 @@ impl OnodIndex {
         let mut writer = io::BufWriter::new(file);
         bincode::serialize_into(&mut writer, self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
+
     fn load(path: &Path) -> io::Result<Self> {
         let file = fs::File::open(path)?;
         let mut reader = io::BufReader::new(file);
@@ -423,25 +583,30 @@ impl OnodIndex {
     }
 }
 
-// Simple hash-based embedding (placeholder for ONNX model)
-fn simple_hash_embedding(text: &str, dim: usize) -> Vec<f32> {
-    let mut embedding = vec![0.0f32; dim];
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for (i, word) in words.iter().enumerate() {
-        let hash = word.len() as f32 * 0.1 + i as f32 * 0.01;
-        let idx = (hash * dim as f32) as usize % dim;
-        embedding[idx] += 1.0;
-    }
-    // Normalize
-    let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 { for x in &mut embedding { *x /= norm; } }
-    embedding
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    let mut dot = 0.0; let mut na = 0.0; let mut nb = 0.0;
+    for i in 0..a.len().min(b.len()) { dot += a[i] as f64 * b[i] as f64; na += a[i] as f64 * a[i] as f64; nb += b[i] as f64 * b[i] as f64; }
+    let norm = na.sqrt() * nb.sqrt();
+    if norm > 0.0 { dot / norm } else { 0.0 }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct SearchResult { doc: u32, score: f64, page: u32, source: String, heading: String, snippet: String, expanded: String }
 
 // ==================== FILE PARSING ====================
+// Filter terpusat: hanya dokumen sumber, bukan artefak index/config.
+fn is_indexable(p: &Path) -> bool {
+    if !p.is_file() { return false; }
+    let name = p.file_name().unwrap_or_default().to_string_lossy();
+    if name.starts_with('.') { return false; }
+    let lower = name.to_lowercase();
+    if lower.contains("enwik8") { return false; }
+    if lower == "index.bin" || lower.ends_with(".bin") { return false; }
+    if lower == "onod.json" || lower == "onod_learned.json" || lower == "config.json" { return false; }
+    if lower.ends_with(".ds_store") { return false; }
+    true
+}
+
 fn read_file(path: &Path) -> io::Result<String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
@@ -483,23 +648,23 @@ fn read_files_parallel(paths: &[PathBuf]) -> Vec<(PathBuf, io::Result<String>)> 
 }
 
 // ==================== REST SERVER ====================
-fn start_server(idx: Arc<OnodIndex>, port: u16) {
+fn start_server(idx: Arc<OnodIndex>, embedder: Arc<TransformerEmbedder>, sparse_embedder: Arc<SparseEmbedder>, reranker: Arc<Reranker>, port: u16) {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).expect("cannot bind");
     eprintln!("Server listening on http://0.0.0.0:{}", port);
-    for stream in listener.incoming() { if let Ok(s) = stream { let idx = idx.clone(); std::thread::spawn(move || { handle_connection(s, &idx); }); } }
+    for stream in listener.incoming() { if let Ok(s) = stream { let idx = idx.clone(); let e = embedder.clone(); let se = sparse_embedder.clone(); let r = reranker.clone(); std::thread::spawn(move || { handle_connection(s, &idx, &e, &se, &r); }); } }
 }
-fn handle_connection(mut stream: TcpStream, idx: &OnodIndex) {
+fn handle_connection(mut stream: TcpStream, idx: &OnodIndex, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, reranker: &Reranker) {
     use std::io::{BufRead, BufReader};
     let mut buf = BufReader::new(&stream); let mut line = String::new(); buf.read_line(&mut line).unwrap();
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 { let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n"); return; }
     let resp = match parts[1] {
-        "/" => fmt(200, &serde_json::json!({"name":"onod","version":"0.5.0"}).to_string()),
+        "/" => fmt(200, &serde_json::json!({"name":"onod","version":"0.6.0","architecture":"transformer+dense+sparse+rerank"}).to_string()),
         "/health" => fmt(200, &serde_json::json!({"status":"ok","chunks":idx.docs.len()}).to_string()),
         p if p.starts_with("/search") => {
             let params: HashMap<String,String> = p.split('?').nth(1).unwrap_or("").split('&').filter_map(|p| p.split_once('=')).map(|(k,v)| (k.replace("%20"," "), v.replace("%20"," "))).collect();
             let q = params.get("q").map(|s| s.as_str()).unwrap_or(""); let top_k: usize = params.get("top_k").and_then(|s| s.parse().ok()).unwrap_or(10);
-            if q.is_empty() { fmt(400, &"{'error':'missing q'}") } else { fmt(200, &serde_json::json!({"query":q,"results":idx.hybrid_search(q,top_k)}).to_string()) }
+            if q.is_empty() { fmt(400, &"{'error':'missing q'}") } else { fmt(200, &serde_json::json!({"query":q,"results":idx.search(q,embedder,sparse_embedder,reranker,top_k)}).to_string()) }
         }
         _ => fmt(404, &"{'error':'not found'}"),
     };
@@ -511,13 +676,42 @@ fn fmt(s: u16, b: &str) -> String { format!("HTTP/1.1 {} {}\r\nContent-Type: app
 fn main() {
     let _ = get_config();
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 { eprintln!("onod v0.5.0 — Hybrid Dense+Sparse Search Engine\nUsage: onod <benchmark|search|serve|save|load> [args]"); std::process::exit(1); }
+    if args.len() < 2 { eprintln!("onod v0.6.0 — Transformer Hybrid Search Engine\nUsage: onod <benchmark|search|serve|save|load> [args]"); std::process::exit(1); }
+    
+    // Initialize embedders
+    eprintln!("Initializing transformer embedder...");
+    let embedder = Arc::new(TransformerEmbedder::new());
+    let reranker = Arc::new(Reranker::new());
+    
     match args[1].as_str() {
         "benchmark" => {
-            let folder = args.get(2).expect("provide folder"); let mut idx = OnodIndex::new(); let t0 = Instant::now();
-            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.') && !p.file_name().unwrap_or_default().to_string_lossy().contains("enwik8")).collect();
-            for (path, result) in read_files_parallel(&paths) { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { if !text.is_empty() { let c = idx.add_text(&text, &name, 0); if c > 0 { eprintln!("  {} -> {} chunks", name, c); } } } }
-            idx.finalize(); eprintln!("\nIndex: {} chunks, {:.2}s\n", idx.docs.len(), t0.elapsed().as_secs_f64());
+            let folder = args.get(2).expect("provide folder");
+            let mut idx = OnodIndex::new();
+            let mut sparse = SparseEmbedder::new();
+            
+            // First pass: collect texts for vocab building
+            let t0 = Instant::now();
+            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+            
+            let results = read_files_parallel(&paths);
+            let texts: Vec<String> = results.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
+            
+            // Build sparse vocab
+            sparse.build_vocab(&texts);
+            
+            // Index all documents
+            for (path, result) in &results {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if let Ok(text) = result {
+                    if !text.is_empty() {
+                        let c = idx.add_text(&text, &name, 0, &embedder, &sparse);
+                        if c > 0 { eprintln!("  {} -> {} chunks", name, c); }
+                    }
+                }
+            }
+            eprintln!("\nIndex: {} chunks, {:.2}s\n", idx.docs.len(), t0.elapsed().as_secs_f64());
+            
+            // 20 Complex Test Queries
             let queries = vec![
                 ("Berapa total uang yang dihasilkan perusahaan dari pelanggan?", vec!["62.714","revenue","pendapatan"]),
                 ("Pendapatan bersih PT ANTAM semester 1 2026 berapa?", vec!["62.714","pendapatan"]),
@@ -540,42 +734,57 @@ fn main() {
                 ("Berapa selisih antara pendapatan dan beban pokok penjualan?", vec!["10.851","laba","bruto","gross"]),
                 (" ANTAM 2026年上半年总收入是多少？", vec!["62.714","revenue","pendapatan"]),
             ];
+            
             let mut hits = 0; let mut total_ms = 0.0;
             for (q, kws) in &queries {
-                let t1 = Instant::now(); let results = idx.hybrid_search(q, 10); let ms = t1.elapsed().as_secs_f64() * 1000.0; total_ms += ms;
+                let t1 = Instant::now();
+                let results = idx.search(q, &embedder, &sparse, &reranker, 10);
+                let ms = t1.elapsed().as_secs_f64() * 1000.0;
+                total_ms += ms;
                 let blob: String = results.iter().flat_map(|r| vec![r.snippet.clone(), r.expanded.clone()]).collect::<Vec<_>>().join(" ").to_lowercase();
-                let ok = kws.iter().any(|k| blob.contains(&k.to_lowercase())); if ok { hits += 1; }
+                let ok = kws.iter().any(|k| blob.contains(&k.to_lowercase()));
+                if ok { hits += 1; }
                 println!("{} {:6.1}ms | {:60} -> {}", if ok {"OK "} else {"FAIL"}, ms, q, if ok {"✅"} else {"❌"});
             }
-            println!("\n=== RESULTS ===\nRecall: {}/{} = {:.1}%\nAvg latency: {:.1}ms\nIndex time: {:.2}s", hits, queries.len(), hits as f64 / queries.len() as f64 * 100.0, total_ms / queries.len() as f64, t0.elapsed().as_secs_f64());
+            println!("\n=== RESULTS ===\nRecall: {}/{} = {:.1}%\nAvg latency: {:.1}ms\nIndex time: {:.2}s",
+                hits, queries.len(), hits as f64 / queries.len() as f64 * 100.0, total_ms / queries.len() as f64, t0.elapsed().as_secs_f64());
         }
         "search" => {
             let folder = args.get(2).expect("provide folder"); let query = args.get(3..).unwrap_or(&[]).join(" ");
             if query.is_empty() { eprintln!("Usage: onod search <folder> <query>"); std::process::exit(1); }
-            let mut idx = OnodIndex::new(); let index_path = Path::new(folder).join("index.bin");
-            if index_path.exists() { eprintln!("Loading index..."); idx = OnodIndex::load(&index_path).expect("failed to load"); }
-            else { eprintln!("Building index..."); let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.') && !p.file_name().unwrap_or_default().to_string_lossy().contains("enwik8")).collect(); for (path, result) in read_files_parallel(&paths) { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0); } } idx.finalize(); let _ = idx.save(&index_path); }
-            let t1 = Instant::now(); let results = idx.hybrid_search(&query, 10); let ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let mut idx = OnodIndex::new(); let mut sparse = SparseEmbedder::new();
+            let index_path = Path::new(folder).join("index.bin");
+            if index_path.exists() {
+                eprintln!("Loading index...");
+                match OnodIndex::load(&index_path) {
+                    Ok(loaded) => { idx = loaded; }
+                    Err(e) => { eprintln!("  stale index ({}), rebuilding...", e); let _ = std::fs::remove_file(&index_path); }
+                }
+            }
+            if idx.docs.is_empty() {
+                eprintln!("Building index...");
+                let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+                let results = read_files_parallel(&paths);
+                let texts: Vec<String> = results.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
+                sparse.build_vocab(&texts);
+                for (path, result) in &results { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0, &embedder, &sparse); } }
+                let _ = idx.save(&index_path);
+            }
+            let t1 = Instant::now(); let results = idx.search(&query, &embedder, &sparse, &reranker, 10); let ms = t1.elapsed().as_secs_f64() * 1000.0;
             eprintln!("Query: \"{}\"\nSearch: {:.1}ms\n", query, ms);
             for (i, r) in results.iter().enumerate() { println!("{}. [{:.4}] {} — {}", i+1, r.score, r.heading, r.snippet.chars().take(150).collect::<String>()); }
         }
         "serve" => {
             let folder = args.get(2).expect("provide folder"); let port: u16 = args.iter().position(|a| a == "--port").and_then(|i| args.get(i+1)).and_then(|p| p.parse().ok()).unwrap_or(8080);
-            let mut idx = OnodIndex::new(); eprintln!("Building index..."); let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.') && !p.file_name().unwrap_or_default().to_string_lossy().contains("enwik8")).collect();
-            for (path, result) in read_files_parallel(&paths) { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0); } } idx.finalize(); eprintln!("Index: {} chunks", idx.docs.len()); start_server(Arc::new(idx), port);
-        }
-        "save" => {
-            let folder = args.get(2).expect("provide folder"); let save_path = args.get(3).expect("provide output path"); let mut idx = OnodIndex::new(); let t0 = Instant::now();
-            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.') && !p.file_name().unwrap_or_default().to_string_lossy().contains("enwik8")).collect();
-            for (path, result) in read_files_parallel(&paths) { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0); } } idx.finalize(); let p = Path::new(save_path);
-            if p.extension().map(|e| e.to_str() == Some("json")).unwrap_or(false) { let _ = fs::write(p, serde_json::to_string_pretty(&idx).unwrap()); } else { idx.save(p).expect("failed"); }
-            eprintln!("Saved: {} chunks -> {} ({:.2}s)", idx.docs.len(), save_path, t0.elapsed().as_secs_f64());
-        }
-        "load" => {
-            let load_path = args.get(2).expect("provide index file"); let idx = OnodIndex::load(Path::new(load_path)).expect("failed to load"); eprintln!("Loaded: {} chunks", idx.docs.len());
-            loop { print!("> "); io::stdout().flush().unwrap(); let mut input = String::new(); if io::stdin().read_line(&mut input).is_err() { break; } let input = input.trim(); if input=="quit"||input=="exit" { break; } if input.is_empty() { continue; }
-                for (i, r) in idx.hybrid_search(input, 10).iter().enumerate() { println!("  {}. [{:.4}] {}", i+1, r.score, r.snippet.chars().take(120).collect::<String>()); }
-            }
+            let mut idx = OnodIndex::new(); let mut sparse = SparseEmbedder::new();
+            eprintln!("Building index..."); let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+            let results = read_files_parallel(&paths); let texts: Vec<String> = results.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
+            sparse.build_vocab(&texts);
+            for (path, result) in &results { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0, &embedder, &sparse); } }
+            eprintln!("Index: {} chunks", idx.docs.len());
+            let idx = Arc::new(idx);
+            let sparse = Arc::new(sparse);
+            start_server(idx, embedder, sparse, reranker, port);
         }
         _ => { eprintln!("Unknown command: {}", args[1]); std::process::exit(1); }
     }

@@ -1,109 +1,119 @@
 # onod — Rust Search Engine
 
-Full Rust search engine untuk dokumen multibahasa. **Hybrid BM25 + Model2Vec embeddings** — akurat seperti vector search, cepat seperti keyword search.
+Full Rust search engine untuk dokumen multibahasa. **Hybrid Transformer (ORT) + Sparse + RRF** — akurat seperti vector search, tetap CPU-only tanpa GPU.
 
 ---
 
 ## Arsitektur
 
 ```
-Document (PDF/TXT/DOCX)
+Document (PDF/TXT/MD)
     ↓
-PDF Parser (pdf_oxide, Rust-native, 0.8ms)
+PDF Parser (pdf_oxide, Rust-native)
     ↓
 Chunking (600 char, kalimat-aware, overlap 140)
     ↓
-┌─────────────┬─────────────┬─────────────┐
-│ BM25 Kata   │ Char-Trigram│ Phrase      │
-│ (exact)     │ (typo)      │ Bigram      │
-└──────┬──────┴──────┬──────┴──────┬──────┘
-       │             │             │
-       ↓             ↓             ↓
-    RRF Fusion (scale-free)
-       │
-       ↓
-    Model2Vec Embeddings (potion-base-8M)
-    → Cosine similarity untuk sinonim otomatis
-       │
-       ↓
-    Financial Boost (angka + terms)
-       │
-       ↓
-    Top-K Results
+┌──────────────────┬──────────────────┐
+│ Dense Transformer│ Sparse TF-IDF    │
+│ (ORT, 384-dim)   │ (vocab 30k)      │
+└────────┬─────────┴────────┬─────────┘
+         │                  │
+         ↓                  ↓
+      RRF Fusion (0.6 dense / 0.4 sparse)
+         │
+         ↓
+      Financial Boost (angka + terms)
+         │
+         ↓
+      Trigram-overlap Boost (typo/morfologi)
+         │
+         ↓
+      Rerank (cosine query vs kandidat)
+         │
+         ↓
+      Top-K Results
 ```
+
+Dense path: `tokenizer.json` (Unigram 250k, trunc 128) → `model.onnx` (`last_hidden_state [batch, seq, 384]`, qint8 ARM64) → mean-pooling + L2-norm. Jika `model.onnx` tidak ada → fallback hash char n-gram (tanpa panic).
 
 ### Komponen Utama
 
-| Komponen | Fungsi | Kecepatan |
+| Komponen | Fungsi | Catatan |
 |---|---|---|
-| **pdf_oxide** | PDF parsing | 0.8ms/page |
-| **BM25** | Keyword search | 0.5ms |
-| **Char-Trigram** | Typo tolerance | - |
-| **Model2Vec** | Semantic embeddings | 8M params, CPU-only |
-| **RRF** | Score fusion | - |
-| **Rayon** | Parallelism | 8-core |
+| **pdf_oxide** | PDF parsing | Rust-native |
+| **ORT Transformer** | Dense embeddings 384-dim | `ort 2.0.0-rc.13`, CPU-only, qint8 |
+| **Sparse TF-IDF** | Keyword exact match | vocab 30k, cosine sparse |
+| **RRF** | Score fusion | 0.6 dense / 0.4 sparse, k=60 |
+| **Trigram boost** | Typo/morfologi | top-200 kandidat saja |
+| **Rayon** | Parallelism | 8-core scoring + parsing |
 
 ---
 
-## Benchmark
+## Benchmark (CPU-only, ORT aktif)
+
+Mesin: Apple M2 8-core, 16GB, arm64. Model: `model.onnx` 113M qint8 + `tokenizer.json` 8.7M di `core/`.
+
+```
+Initializing transformer embedder...
+  ORT model loaded: model.onnx (dim=384)
+  ANTAM FS 30 Juni 2026.pdf -> 1909 chunks
+  10840.pdf -> 229 chunks
+  FS Adaro Andalan Indonesia - 31 March 2026.pdf -> 1612 chunks
+
+Index: 3750 chunks, 100.49s
+
+OK    79.7ms | Berapa total uang yang dihasilkan perusahaan dari pelanggan? -> ✅
+OK    66.6ms | Pendapatan bersih PT ANTAM semester 1 2026 berapa?           -> ✅
+OK    62.7ms | How much money did the company earn from customer contracts? -> ✅
+... (20 query, termasuk Cina: ANTAM 2026年上半年总收入是多少？ -> ✅)
+
+=== RESULTS ===
+Recall: 20/20 = 100.0%
+Avg latency: 54.0ms
+Index time: 101.57s
+```
 
 ### Accuracy
 
-| Query | Expected | Result | Latency |
-|---|---|---|---|
-| What is the total revenue? | revenue, pendapatan | OK | 0.7ms |
-| Siapa saja direksi? | direksi, director | OK | 0.5ms |
-| Berapa laba bruto? | laba, profit | OK | 0.5ms |
-| What are the main commodities? | gold, nickel | OK | 0.8ms |
-| Net profit margin? | profit, margin | OK | 0.5ms |
-
-**Recall: 5/5 = 100%**
+20 ground-truth queries di `tests/test_20.txt` (EN/ID/CN, revenue, laba, aset, emas, direksi, dividen, arus kas). **Recall: 20/20 = 100%**, termasuk query Cina yang gagal di mode hash-fallback.
 
 ### Performance
 
-| Metric | Value | Target |
+| Metric | Value (ORT CPU) | Target |
 |---|---|---|
-| Avg query latency | **0.6ms** | <100ms |
-| p50 query latency | **0.5ms** | <100ms |
-| Max query latency | **0.8ms** | <100ms |
-| Index time (Rust only) | **~2.4s** | <5s |
-| Index time (total) | **2.46s** | <60s |
+| Avg query latency | **54.0ms** | <100ms ✅ |
+| Min / Max query | **45.4 / 79.7ms** | <100ms ✅ |
+| Index time (3750 chunks) | **~100s** | <60s ❌ |
+| Throughput index | ~37 chunk/s (~27ms/chunk) | — |
 | Total chunks | 3750 | — |
-| Word terms | ~7000 | — |
-| Trigram terms | ~35000 | — |
-| Index size (binary) | 16MB | — |
-| Load time (binary) | 0.03s | — |
-| PDF parser | pdf_oxide (Rust-native) | — |
-| mmap support | >100MB files | — |
-| SIMD BM25 | 8 docs/batch | — |
+| Embedding dim | 384 | — |
+| GPU | Tidak (CPU-only) | — |
 
-### Scaling
-
-| Corpus | Chunks | Index Time | Query p50 |
-|---|---|---|---|
-| ANTAM (1.6 MB) | 1909 | 1.2s | 0.5ms |
-| Adaro (2.7 MB) | 1612 | 1.0s | 0.6ms |
-| 10840 (25 MB) | 229 | 0.3s | 0.5ms |
-| Combined (4.3 MB) | 3750 | 2.5s | 0.6ms |
+Bottleneck indexing = inference per-chunk serial (Mutex, satu `Session::run` per chunk). Tiap `run` tetap pakai intra-op threads CPU. Optimasi berikut: batch inference (8-16 chunk per `run`) + session per-thread.
 
 ### Comparison
 
-| System | Recall | Latency | GPU? | Dependencies |
+| System | Recall | Query | Index (3750) | GPU? |
 |---|---|---|---|---|
-| BM25 (Python) | 100% | 0.7ms | No | numpy |
-| Dense (MiniLM) | 80% | 55ms | Optional | sentence-transformers |
-| SPLADE (stub) | 100% | 0.9ms | No | numpy |
-| **onod (Rust)** | **100%** | **2.5ms** | **No** | **None** |
+| Hash-fallback (tanpa model) | 19/20 | ~2ms | ~2-8s | No |
+| **onod + ORT (CPU)** | **20/20** | **~54ms** | **~100s** | **No** |
+| Dense MiniLM Python | ~80% | ~55ms | ~15s + GPU | Optional |
 
 ---
 
 ## Instalasi
 
-### Rust
+### Rust + Model
 
 ```bash
 # Install Rust (jika belum)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Taruh model di core/ (tidak di-commit, lihat .gitignore):
+# core/model.onnx (113M, qint8, input: input_ids/attention_mask/token_type_ids,
+#                  output: last_hidden_state [batch, seq, 384])
+# core/tokenizer.json (Unigram 250k, trunc 128)
+ls core/model.onnx core/tokenizer.json
 
 # Build
 cd core
@@ -113,11 +123,13 @@ cargo build --release
 # core/target/release/onod
 ```
 
+Model tidak di-push ke git (terlalu besar). Ambil dari HF `paraphrase-multilingual-MiniLM-L12-v2` varian `onnx/model_qint8_arm64.onnx` + `tokenizer.json`, rename ke `model.onnx` / `tokenizer.json`.
+
 ---
 
 ## Cara Pakai
 
-### 1. Benchmark
+### 1. Benchmark (20 query, harus 20/20)
 
 ```bash
 cd core
@@ -125,34 +137,17 @@ cargo build --release
 ./target/release/onod benchmark ../files/
 ```
 
-Output:
-```
-  [1/2] FS Adaro Andalan Indonesia.pdf ... 1612 chunks
-  [2/2] ANTAM FS 30 Juni 2026.pdf ... 2002 chunks
-
-Index: 3614 chunks, 8.05s
-
-OK     1.8ms | What is the total revenue?         -> revenue, pendapatan
-OK     1.8ms | Siapa saja direksi?                 -> direksi, director
-OK     1.5ms | Berapa laba bruto?                  -> laba, profit
-OK     1.8ms | What are the main commodities?      -> gold, nickel
-OK     4.3ms | Net profit margin?                   -> profit, margin
-
-=== RESULTS ===
-Recall: 5/5 = 100.0%
-Avg latency: 2.2ms
-```
-
-### 2. Index folder
+### 2. Search (pakai `index.bin` cache jika ada)
 
 ```bash
-./target/release/onod index ../files/
+./target/release/onod search ../files/ "Berapa total pendapatan?"
 ```
 
-### 3. Search (coming soon)
+### 3. Serve REST
 
 ```bash
-./target/release/onod search ../files/ "What is revenue?"
+./target/release/onod serve ../files/ --port 8080
+# GET /health, GET /search?q=...&top_k=10
 ```
 
 ---
@@ -168,35 +163,32 @@ Avg latency: 2.2ms
          ▼
   Chunking: 600 char, 140 overlap, kalimat-aware
          │
-         ├──▶ Kata (BM25) ──┐
-         │                   │
-         ├──▶ Trigram ───────┼──▶ RRF Fusion ──▶ Top-K
-         │   (typo/morfologi)│    (scale-free)
-         │                   │
-         └──▶ Bigram ────────┘
-             (beban_pokok)
+         ├──▶ Dense Transformer (ORT 384-dim) ──┐
+         │                                      ├──▶ RRF ──▶ Financial boost
+         └──▶ Sparse TF-IDF ───────────────────┘            ──▶ Trigram boost
+                                                             ──▶ Rerank ──▶ Top-K
 ```
 
 ### Tokenisasi
 
-- **Kata**: lowercase, angka ribuan utuh `62.714.280`, stopword removal (EN/ID/AR/TR/ZH)
-- **Trigram**: `#python#` → `#py`, `pyt`, `yth`, `tho`, `hon`, `on#` — tahan typo
-- **Bigram**: `beban_pokok`, `pokok_penjualan` — tahan frasa
+- **Transformer**: `tokenizer.json` Unigram 250k, `WhitespaceSplit + Metaspace`, trunc 128, pad `<pad>` id 1.
+- **Kata (sparse)**: lowercase, angka ribuan utuh `62.714.280`, stopword removal (EN/ID/AR/TR/ZH).
+- **Trigram boost**: `#kata#` → 3-gram, hanya top-200 kandidat (murah).
 
-### BM25
+### Dense (ORT)
 
-Okapi BM25 dengan:
-- `k1=1.2`, `b=0.75` (standar)
-- Coverage bonus: chunk yang mengandung SEMUA query term dapat boost
-- IDF: `log((N-df+0.5)/(df+0.5) + 1)`
+- Input 3 tensor `[1, seq]`: `input_ids`, `attention_mask`, `token_type_ids=0`.
+- Output `last_hidden_state [1, seq, 384]` → mean-pooling pakai mask → L2-norm.
+- Query & doc pakai jalur sama (`embed_query` → `embed` jika model ada), jika model gagal → fallback hash-IDF.
 
 ### Fusion (RRF)
 
-Reciprocal Rank Fusion — scale-free, tidak perlu normalisasi skala:
 ```
-score(d) = 0.72/(60+rank_kata) + 0.28/(60+rank_trigram)
+score(d) = 0.6/(60+rank_dense) + 0.4/(60+rank_sparse)
+         + financial_boost (0.3 jika terms finansial + >20 digit)
+         + 2.0 * trigram_overlap
+rerank: 0.5*fusion + 0.5*cosine(query_dense, doc_dense)
 ```
-Boost: +0.6 untuk angka exact (62.714.280)
 
 ---
 
@@ -206,16 +198,19 @@ Boost: +0.6 untuk angka exact (62.714.280)
 onod/
 ├── core/
 │   ├── src/
-│   │   ├── main.rs      # binary: index, benchmark
-│   │   └── lib.rs       # library (FFI untuk Python binding)
+│   │   ├── main.rs      # binary: benchmark, search, serve (ORT + hybrid)
+│   │   └── lib.rs       # library FFI (BM25 klasik)
 │   ├── Cargo.toml
-│   └── Cargo.lock
+│   ├── model.onnx       # tidak di-commit (113M, qint8)
+│   └── tokenizer.json   # tidak di-commit (8.7M)
 ├── files/               # test documents
 │   ├── ANTAM FS 30 Juni 2026.pdf
 │   ├── FS Adaro Andalan Indonesia.pdf
 │   ├── 10840.pdf
 │   └── enwik8
-├── .gitignore
+├── tests/test_20.txt    # 20 ground-truth queries
+├── benchmarks/ANTAM_benchmark.md
+├── paper/               # paper two-column + generate_paper.py
 ├── PRD.md
 └── README.md
 ```
@@ -226,39 +221,36 @@ onod/
 
 | Crate | Fungsi |
 |---|---|
-| `rayon` | Parallel processing (8-core) |
+| `ort 2.0.0-rc.13` | ONNX Runtime, CPU EP |
+| `tokenizers 0.21` | Load `tokenizer.json` |
+| `ndarray 0.17` | Tensor `[1, seq]` |
+| `rayon` | Parallel scoring/parsing (8-core) |
 | `unicode-normalization` | NFKC normalization |
-| `memmap2` | Memory-mapped file I/O |
-| `serde` + `serde_json` | Serialization |
-| `pdf_oxide` | PDF parsing (Rust-native) |
-| `model2vec-rs` | Static embeddings (8M params) |
+| `memmap2` | mmap file >100MB |
+| `serde` + `serde_json` + `bincode` | Serialization index |
+| `pdf_oxide` | PDF parsing Rust-native |
 
 ---
 
 ## CPU Usage
 
-Engine menggunakan **full CPU** via rayon thread pool:
-- Indexing: paralel per-chunk + Model2Vec embeddings
-- Search: paralel BM25 kata + BM25 trigram + semantic similarity
-- PDF parsing: pdf_oxide (Rust-native, no Python)
-- mmap: zero-copy reading untuk file >100MB
-- SIMD: batch BM25 scoring 8 docs/batch
-
-Untuk 8-core MacBook: ~8x speedup vs single-thread.
+- ORT CPU-only, tanpa GPU/CUDA/CoreML. Model qint8 ARM64 optimal di Apple Silicon.
+- Search: `rayon::par_iter` untuk dense cosine + sparse cosine (full 8-core).
+- Indexing: parsing paralel, inference serial via `Mutex<Session>` (perlu batching untuk full paralel).
+- Untuk 8-core MacBook: scoring ~8x speedup vs single-thread; inference ~27ms/chunk.
 
 ---
 
 ## Roadmap
 
-- [x] Full Rust core: tokenize, chunk, BM25, trigram, bigram, RRF
-- [x] Parallel indexing via rayon
-- [x] Benchmark: 100% recall, <1ms latency
-- [x] Parallel PDF parsing (batch subprocess)
-- [x] Persistent index (save/load binary + JSON)
-- [x] CLI search mode
-- [x] REST API server (stdlib)
-- [x] mmap-based index untuk file >1GB
-- [x] SIMD-accelerated BM25 scoring
+- [x] Full Rust core: chunk, sparse, RRF, financial boost
+- [x] ORT transformer dense (384-dim, mean-pool, CPU-only)
+- [x] Benchmark 20/20 = 100%, avg 54ms <100ms
+- [x] CLI search + REST server + `index.bin` cache
+- [x] mmap + parallel parsing
+- [ ] Batch inference (8-16 chunk/run) → index <60s
+- [ ] Session per-thread ( Hilangkan Mutex bottleneck)
+- [ ] Persistent dense index + incremental update
 
 ---
 
