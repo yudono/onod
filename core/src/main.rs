@@ -154,8 +154,7 @@ impl TransformerEmbedder {
             Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect(),
         };
         let n = encodings.len();
-        // Truncate to 128 tokens — MiniLM max 512, tapi 128 sudah cukup untuk 4800-char chunks.
-        // Mengurangi komputasi ~4x tanpa penurunan recall signifikan.
+        // Truncate to 128 tokens — MiniLM max 512, 128 sudah cukup untuk representasi chunk.
         let max_seq = encodings.iter().map(|e| e.get_ids().len().min(128)).max().unwrap_or(1).max(1);
 
         // Build batched arrays [n, max_seq]
@@ -818,6 +817,44 @@ fn handle_connection(mut stream: TcpStream, idx: &OnodIndex, embedder: &Transfor
 }
 fn fmt(s: u16, b: &str) -> String { format!("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", s, match s {200=>"OK",400=>"Bad Request",404=>"Not Found",_=>"Error"}, b.len(), b) }
 
+fn load_or_build_index(folder: &str, embedder: &TransformerEmbedder) -> (OnodIndex, SparseEmbedder) {
+    let cache_path = std::path::Path::new(folder).join("index.bin");
+    let mut idx = OnodIndex::new();
+    let mut sparse = SparseEmbedder::new();
+
+    if cache_path.exists() {
+        match OnodIndex::load(&cache_path) {
+            Ok(loaded) => {
+                idx = loaded;
+                eprintln!("Loaded cached index: {} chunks", idx.docs.len());
+                return (idx, sparse);
+            }
+            Err(_) => { eprintln!("Cache corrupt, rebuilding..."); }
+        }
+    }
+
+    let t0 = Instant::now();
+    let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+    let results = read_files_parallel(&paths);
+    let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+    }).collect();
+    let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+    sparse.build_vocab(&texts);
+
+    eprintln!("Batch embedding {} files...", file_texts.len());
+    idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
+        if cur == 1 || cur == tot || cur % 100 == 0 {
+            eprint!("\r  Embedding [{}/{}]", cur, tot);
+            if cur == tot { eprintln!(); }
+        }
+    }));
+    let _ = idx.save(&cache_path);
+    eprintln!("Index: {} chunks, {:.2}s (cached)", idx.docs.len(), t0.elapsed().as_secs_f64());
+    (idx, sparse)
+}
+
 // ==================== MAIN ====================
 fn main() {
     let _ = get_config();
@@ -925,39 +962,14 @@ fn main() {
         "search" => {
             let folder = args.get(2).expect("provide folder"); let query = args.get(3..).unwrap_or(&[]).join(" ");
             if query.is_empty() { eprintln!("Usage: onod search <folder> <query>"); std::process::exit(1); }
-            let mut idx = OnodIndex::new(); let mut sparse = SparseEmbedder::new();
-            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
-            let results = read_files_parallel(&paths);
-            let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
-                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
-            }).collect();
-            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
-            sparse.build_vocab(&texts);
-            idx.build_index_batch(&file_texts, &embedder, &sparse, None);
+            let (idx, sparse) = load_or_build_index(folder, &embedder);
             let t1 = Instant::now(); let results = idx.search(&query, &embedder, &sparse, &reranker, 10); let ms = t1.elapsed().as_secs_f64() * 1000.0;
             eprintln!("Query: \"{}\"\nSearch: {:.1}ms\n", query, ms);
             for (i, r) in results.iter().enumerate() { println!("{}. [{:.4}] {} — {}", i+1, r.score, r.heading, r.snippet.chars().take(150).collect::<String>()); }
         }
         "serve" => {
             let folder = args.get(2).expect("provide folder"); let port: u16 = args.iter().position(|a| a == "--port").and_then(|i| args.get(i+1)).and_then(|p| p.parse().ok()).unwrap_or(8080);
-            let mut idx = OnodIndex::new(); let mut sparse = SparseEmbedder::new();
-            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
-            let results = read_files_parallel(&paths);
-            let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
-                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
-            }).collect();
-            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
-            sparse.build_vocab(&texts);
-            eprintln!("Batch embedding {} files...", file_texts.len());
-            idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
-                if cur == 1 || cur == tot || cur % 100 == 0 {
-                    eprint!("\r  Embedding [{}/{}]", cur, tot);
-                    if cur == tot { eprintln!(); }
-                }
-            }));
-            eprintln!("Index: {} chunks ready", idx.docs.len());
+            let (idx, sparse) = load_or_build_index(folder, &embedder);
             let idx = Arc::new(idx);
             let sparse = Arc::new(sparse);
             start_server(idx, embedder, sparse, reranker, port);
