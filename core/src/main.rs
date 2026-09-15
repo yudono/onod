@@ -482,6 +482,168 @@ fn read_folder(folder: &str) -> Vec<(String, String)> {
     }).collect()
 }
 
+// ==================== WORKER MANAGEMENT ====================
+const WORKER_PORT: u16 = 9091;
+const WORKER_PID_FILE: &str = "/tmp/onod_worker.pid";
+const WORKER_IDLE_SECS: u64 = 300; // 5 minutes
+
+fn worker_pid_path() -> PathBuf { PathBuf::from(WORKER_PID_FILE) }
+
+fn worker_ping() -> bool {
+    match TcpStream::connect(format!("127.0.0.1:{}", WORKER_PORT)) {
+        Ok(mut s) => {
+            let _ = s.write_all(b"PING\nEND\n");
+            let mut resp = String::new();
+            let mut reader = BufReader::new(&s);
+            let _ = reader.read_line(&mut resp);
+            resp.contains("PONG")
+        }
+        Err(_) => false,
+    }
+}
+
+fn worker_ensure_alive() {
+    if worker_ping() { return; }
+    let _ = fs::remove_file(worker_pid_path());
+    eprintln!("  Spawning worker...");
+    let exe = env::current_exe().expect("cannot find executable");
+    match std::process::Command::new(&exe)
+        .arg("--worker")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn() {
+        Ok(_) => {}
+        Err(e) => { eprintln!("  Worker spawn failed: {}", e); return; }
+    }
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if worker_ping() { eprintln!("  Worker ready."); return; }
+    }
+    eprintln!("  Worker did not start in time");
+}
+
+fn worker_send(cmd: &str) -> String {
+    match TcpStream::connect(format!("127.0.0.1:{}", WORKER_PORT)) {
+        Ok(mut s) => {
+            let _ = s.write_all(format!("{}\nEND\n", cmd).as_bytes());
+            let mut resp = String::new();
+            let mut reader = BufReader::new(&s);
+            let _ = reader.read_line(&mut resp);
+            resp.trim().to_string()
+        }
+        Err(_) => String::from("ERROR connection failed"),
+    }
+}
+
+fn worker_run() {
+    // Write PID
+    let _ = fs::write(worker_pid_path(), std::process::id().to_string());
+
+    eprintln!("  Loading model (worker, once)...");
+    let t0 = Instant::now();
+    let embedder = Arc::new(TransformerEmbedder::new());
+    eprintln!("  Model ready in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+
+    let idx: Arc<RwLock<Option<Arc<OnodIndex>>>> = Arc::new(RwLock::new(None));
+    let sparse: Arc<RwLock<Option<Arc<SparseEmbedder>>>> = Arc::new(RwLock::new(None));
+    let last_request = Arc::new(RwLock::new(Instant::now()));
+
+    // Idle timeout thread
+    let last_clone = last_request.clone();
+    let pid_path = worker_pid_path();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let elapsed = last_clone.read().unwrap().elapsed().as_secs();
+        if elapsed >= WORKER_IDLE_SECS {
+            eprintln!("  Worker: idle {}s, shutting down.", elapsed);
+            let _ = fs::remove_file(&pid_path);
+            std::process::exit(0);
+        }
+    });
+
+    // Check if port is already in use (another worker running)
+    if TcpStream::connect(format!("127.0.0.1:{}", WORKER_PORT)).is_ok() {
+        eprintln!("  Worker already running on port {}", WORKER_PORT);
+        let _ = fs::write(worker_pid_path(), std::process::id().to_string());
+        // Just keep running as a duplicate - the first one wins
+        // But since we can't bind, exit gracefully
+        return;
+    }
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", WORKER_PORT)).expect("cannot bind worker");
+    // Mark alive
+    *last_request.write().unwrap() = Instant::now();
+
+    for stream in listener.incoming() {
+        if let Ok(mut stream) = stream {
+            let embedder = embedder.clone();
+            let idx = idx.clone();
+            let sparse = sparse.clone();
+            let last_request = last_request.clone();
+            std::thread::spawn(move || {
+                *last_request.write().unwrap() = Instant::now();
+                let mut reader = BufReader::new(&stream);
+                let mut cmd = String::new();
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if trimmed == "END" { break; }
+                            cmd.push_str(trimmed);
+                            cmd.push(' ');
+                        }
+                    }
+                }
+                let cmd = cmd.trim();
+                let resp = match cmd {
+                    "PING" => "PONG".to_string(),
+                    _ => match cmd.split_once(' ') {
+                        Some(("INDEX", folder)) => {
+                            let cache_path = Path::new(folder).join("index.bin");
+                            let t = Instant::now();
+                            let mut new_idx = OnodIndex::new();
+                            let mut sp = SparseEmbedder::new();
+                            let file_texts = read_folder(folder);
+                            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+                            sp.build_vocab(&texts);
+                            new_idx.build_index_batch(&file_texts, &embedder, &sp, None);
+                            let _ = new_idx.save(&cache_path);
+                            let index_ms = t.elapsed().as_secs_f64() * 1000.0;
+                            let chunks = new_idx.docs.len();
+                            *idx.write().unwrap() = Some(Arc::new(new_idx));
+                            *sparse.write().unwrap() = Some(Arc::new(sp));
+                            format!("OK {} {:.0}", chunks, index_ms)
+                        }
+                        Some(("SEARCH", query)) => {
+                            let idx_g = idx.read().unwrap();
+                            let sparse_g = sparse.read().unwrap();
+                            match (idx_g.as_ref(), sparse_g.as_ref()) {
+                                (Some(idx), Some(sparse)) => {
+                                    let t = Instant::now();
+                                    let results = idx.search(query, &embedder, sparse, 10);
+                                    let ms = t.elapsed().as_secs_f64() * 1000.0;
+                                    format!("RESULTS {:.1} {}", ms, serde_json::to_string(&results).unwrap_or_default())
+                                }
+                                _ => "ERROR no index".to_string(),
+                            }
+                        }
+                        Some(("SHUTDOWN", _)) => {
+                            let _ = fs::remove_file(WORKER_PID_FILE);
+                            std::process::exit(0);
+                        }
+                        _ => format!("ERROR unknown cmd: {}", cmd),
+                    }
+                };
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(b"\n");
+            });
+        }
+    }
+}
+
 // ==================== HTTP HELPERS ====================
 fn http_resp(code: u16, body: &str) -> String {
     let status = match code { 200=>"OK", 400=>"Bad Request", 404=>"Not Found", 503=>"Service Unavailable", _=>"Error" };
@@ -501,70 +663,68 @@ struct DaemonState {
 fn main() {
     let _ = get_config();
     let args: Vec<String> = env::args().collect();
+
+    // Worker mode: run as background process
+    if args.iter().any(|a| a == "--worker") {
+        worker_run();
+        return;
+    }
+
     if args.len() < 2 {
-        eprintln!("onod v0.9.0 — Transformer Hybrid Search\n\nUsage:\n  onod search <folder> <query>       Index + search (auto, no cache)\n  onod benchmark <folder>            Index + benchmark 20 queries\n  onod daemon <folder> [--port 9090] Model always warm, index on demand\n  onod serve <folder> [--port 8080]  HTTP server");
+        eprintln!("onod v0.10.0 — Transformer Hybrid Search\n\nUsage:\n  onod search <folder> <query>       Search (uses warm worker)\n  onod benchmark <folder>            Benchmark 20 queries\n  onod test <folder> [test_file]     Run test suite (default: tests/test_25.txt)\n  onod daemon <folder> [--port 9090] HTTP daemon\n  onod serve <folder> [--port 8080]  HTTP server\n  onod worker stop                   Stop background worker\n\nWorker auto-starts on first command, expires after 5 min idle.");
         std::process::exit(1);
     }
 
     match args[1].as_str() {
-        // ===== SEARCH: index inline + search =====
+        "worker" => {
+            if args.get(2).map(|s| s.as_str()) == Some("stop") {
+                let _ = TcpStream::connect(format!("127.0.0.1:{}", WORKER_PORT)).map(|mut s| { let _ = s.write_all(b"SHUTDOWN\nEND\n"); });
+                let _ = fs::remove_file(worker_pid_path());
+                eprintln!("Worker stopped.");
+            } else {
+                eprintln!("Usage: onod worker stop");
+            }
+        }
+
+        // ===== SEARCH: route through worker =====
         "search" => {
             let folder = args.get(2).expect("provide folder");
             let query = args.get(3..).unwrap_or(&[]).join(" ");
             if query.is_empty() { eprintln!("Usage: onod search <folder> <query>"); std::process::exit(1); }
 
-            eprintln!("Loading model...");
-            let t0 = Instant::now();
-            let embedder = TransformerEmbedder::new();
-
-            let model_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-            eprintln!("Indexing...");
-            let t1 = Instant::now();
-            let file_texts = read_folder(folder);
-            let mut idx = OnodIndex::new();
-            let mut sparse = SparseEmbedder::new();
-            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
-            sparse.build_vocab(&texts);
-            idx.build_index_batch(&file_texts, &embedder, &sparse, None);
-            let index_ms = t1.elapsed().as_secs_f64() * 1000.0;
-
-            eprintln!("Searching...");
-            let t2 = Instant::now();
-            let results = idx.search(&query, &embedder, &sparse, 10);
-            let search_ms = t2.elapsed().as_secs_f64() * 1000.0;
-
-            eprintln!("\nModel: {:.0}ms | Index: {:.0}ms ({} chunks) | Search: {:.1}ms\n", model_ms, index_ms, idx.docs.len(), search_ms);
-            for (i, r) in results.iter().enumerate() {
-                println!("{}. [{:.4}] {} — {}", i+1, r.score, r.heading, r.snippet.chars().take(150).collect::<String>());
+            worker_ensure_alive();
+            // Index if needed
+            let resp = worker_send(&format!("INDEX {}", folder));
+            if resp.starts_with("OK") { eprintln!("  {}", resp); }
+            // Search
+            let t = Instant::now();
+            let resp = worker_send(&format!("SEARCH {}", query));
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if let Some(json_str) = resp.strip_prefix("RESULTS ") {
+                let parts: Vec<&str> = json_str.splitn(2, ' ').collect();
+                let query_ms: f64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                if let Ok(results) = serde_json::from_str::<Vec<SearchResult>>(parts.get(1).unwrap_or(&"[]")) {
+                    eprintln!("\nWorker search: {:.1}ms (roundtrip {:.1}ms)\n", query_ms, ms);
+                    for (i, r) in results.iter().enumerate() {
+                        println!("{}. [{:.4}] {} — {}", i+1, r.score, r.heading, r.snippet.chars().take(150).collect::<String>());
+                    }
+                }
+            } else {
+                eprintln!("Worker error: {}", resp);
             }
         }
 
-        // ===== BENCHMARK: index inline + 20 queries =====
+        // ===== BENCHMARK: route through worker =====
         "benchmark" => {
             let folder = args.get(2).expect("provide folder");
 
-            eprintln!("Loading model...");
-            let t0 = Instant::now();
-            let embedder = TransformerEmbedder::new();
-
-            let model_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-            eprintln!("Indexing...");
-            let t1 = Instant::now();
-            let file_texts = read_folder(folder);
-            let ms_read = t1.elapsed().as_secs_f64();
-            let mut idx = OnodIndex::new();
-            let mut sparse = SparseEmbedder::new();
-            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
-            sparse.build_vocab(&texts);
-            let ms_vocab = t1.elapsed().as_secs_f64();
-            idx.build_index_batch(&file_texts, &embedder, &sparse, None);
-            let ms_total = t1.elapsed().as_secs_f64();
-            let ms_embed = ms_total - ms_vocab;
-            let index_ms = ms_total * 1000.0;
-            eprintln!("Index: {} chunks, {:.1}s (read={:.1}s vocab={:.1}s embed={:.1}s)\n",
-                idx.docs.len(), ms_total, ms_read, ms_vocab - ms_read, ms_embed);
+            worker_ensure_alive();
+            // Index
+            eprintln!("Indexing via worker...");
+            let t_idx = Instant::now();
+            let resp = worker_send(&format!("INDEX {}", folder));
+            let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("  {}", resp);
 
             let queries = vec![
                 ("Berapa total uang yang dihasilkan perusahaan dari pelanggan?", vec!["62.714","revenue","pendapatan"]),
@@ -588,19 +748,73 @@ fn main() {
                 ("Berapa selisih antara pendapatan dan beban pokok penjualan?", vec!["laba kotor","gross profit","selisih"]),
                 ("Arus kas dari kegiatan operasi berapa?", vec!["arus","kas","operasi","cash"]),
             ];
+
             let mut hits = 0; let mut total_ms = 0.0;
             for (q, kws) in &queries {
                 let t = Instant::now();
-                let results = idx.search(q, &embedder, &sparse, 10);
+                let resp = worker_send(&format!("SEARCH {}", q));
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 total_ms += ms;
-                let blob: String = results.iter().flat_map(|r| vec![r.snippet.clone(), r.expanded.clone()]).collect::<Vec<_>>().join(" ").to_lowercase();
-                let ok = kws.iter().any(|k| blob.contains(&k.to_lowercase()));
+                let ok = if let Some(json_str) = resp.strip_prefix("RESULTS ") {
+                    let parts: Vec<&str> = json_str.splitn(2, ' ').collect();
+                    if let Ok(results) = serde_json::from_str::<Vec<SearchResult>>(parts.get(1).unwrap_or(&"[]")) {
+                        let blob: String = results.iter().flat_map(|r| vec![r.snippet.clone(), r.expanded.clone()]).collect::<Vec<_>>().join(" ").to_lowercase();
+                        kws.iter().any(|k| blob.contains(&k.to_lowercase()))
+                    } else { false }
+                } else { false };
                 if ok { hits += 1; }
                 println!("{} {:6.1}ms | {:60} -> {}", if ok {"OK "} else {"FAIL"}, ms, q, if ok {"✅"} else {"❌"});
             }
-            println!("\n=== RESULTS ===\nModel load: {:.0}ms\nRecall: {}/{} = {:.1}%\nAvg latency: {:.1}ms\nIndex: {:.1}s",
-                model_ms, hits, queries.len(), hits as f64 / queries.len() as f64 * 100.0, total_ms / queries.len() as f64, index_ms / 1000.0);
+            println!("\n=== RESULTS ===\nRecall: {}/{} = {:.1}%\nAvg latency: {:.1}ms\nIndex (worker): {:.1}s",
+                hits, queries.len(), hits as f64 / queries.len() as f64 * 100.0, total_ms / queries.len() as f64, idx_ms / 1000.0);
+        }
+
+        // ===== TEST: run test_25.txt queries =====
+        "test" => {
+            let folder = args.get(2).expect("provide folder");
+            let test_file = args.get(3).map(|s| s.as_str()).unwrap_or("../tests/test_25.txt");
+
+            worker_ensure_alive();
+            // Index
+            eprintln!("Indexing via worker...");
+            let t_idx = Instant::now();
+            let resp = worker_send(&format!("INDEX {}", folder));
+            let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("  {}", resp);
+
+            // Load test queries
+            let content = fs::read_to_string(test_file).unwrap_or_else(|e| { eprintln!("Cannot read {}: {}", test_file, e); std::process::exit(1); });
+            let mut queries: Vec<(String, Vec<String>)> = Vec::new();
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                // Format: "N. query -> keyword1, keyword2, ..."
+                if let Some((q_part, kw_part)) = line.split_once("->") {
+                    let query = q_part.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').trim().to_string();
+                    let keywords: Vec<String> = kw_part.split(',').map(|k| k.trim().to_lowercase()).collect();
+                    queries.push((query, keywords));
+                }
+            }
+            if queries.is_empty() { eprintln!("No queries found in {}", test_file); std::process::exit(1); }
+
+            let mut hits = 0; let mut total_ms = 0.0;
+            for (q, kws) in &queries {
+                let t = Instant::now();
+                let resp = worker_send(&format!("SEARCH {}", q));
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                total_ms += ms;
+                let ok = if let Some(json_str) = resp.strip_prefix("RESULTS ") {
+                    let parts: Vec<&str> = json_str.splitn(2, ' ').collect();
+                    if let Ok(results) = serde_json::from_str::<Vec<SearchResult>>(parts.get(1).unwrap_or(&"[]")) {
+                        let blob: String = results.iter().flat_map(|r| vec![r.snippet.clone(), r.expanded.clone()]).collect::<Vec<_>>().join(" ").to_lowercase();
+                        kws.iter().any(|k| blob.contains(k))
+                    } else { false }
+                } else { false };
+                if ok { hits += 1; }
+                println!("{} {:6.1}ms | {:60} -> {}", if ok {"OK "} else {"FAIL"}, ms, q, if ok {"✅"} else {"❌"});
+            }
+            println!("\n=== TEST RESULTS ===\nRecall: {}/{} = {:.1}%\nAvg latency: {:.1}ms\nIndex (worker): {:.1}s",
+                hits, queries.len(), hits as f64 / queries.len() as f64 * 100.0, total_ms / queries.len() as f64, idx_ms / 1000.0);
         }
 
         // ===== DAEMON: model always warm, index on demand =====

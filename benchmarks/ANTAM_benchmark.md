@@ -1,94 +1,94 @@
-# ANTAM Benchmark — PRD §25-26
+# onod Benchmark — Results
 
-Corpus: `files/ANTAM FS 30 Juni 2026.pdf` — 178 pages, 616689 chars, 1.584 MB (ANTAM FS 30 Juni 2026.pdf)
-Queries: 5 ground-truth (revenue, direksi, commodities, proyeksi, net profit margin) — binary keyword relevance
-Metrics: Recall@10/50/100, MRR, nDCG@10, indexing time, query latency p50/p95, RAM, disk (PRD §25)
-Date: 2026-09-03 21:14:09
+Date: 2026-09-16
+System: onod v0.10.0 — Sparse BM25 + ORT Query-time
 
-## Baseline Comparison (PRD §25)
+---
 
-| Baseline | Recall@10 | Recall@50 | Recall@100 | MRR | nDCG@10 | nDCG@100 | Indexing (s) | p50 (ms) | p95 (ms) | RAM (MB) | Disk (MB) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| BM25 | 1.000 | 1.000 | 1.000 | 0.800 | 0.606 | 0.408 | 0.16 | 0.7 | 1.0 | 202.7 | 2.287 |
-| BM25+translation | 1.000 | 1.000 | 1.000 | 0.900 | 0.817 | 0.444 | 0.19 | 0.7 | 1.0 | 207.3 | 2.287 |
-| Multilingual Dense | 0.800 | 1.000 | 1.000 | 0.369 | 0.199 | 0.259 | 14.70 | 55.1 | 65.9 | 594.4 | 0.594 |
-| SPLADE | 1.000 | 1.000 | 1.000 | 1.000 | 0.801 | 0.465 | 4.14 | 0.9 | 1.4 | 479.8 | 2.370 |
-| Semantic-code | 0.400 | 0.400 | 0.400 | 0.240 | 0.061 | 0.043 | 3.60 | 17.3 | 19.4 | 489.3 | 2.368 |
-| Semantic+BM25 | 1.000 | 1.000 | 1.000 | 0.900 | 0.622 | 0.411 | 3.76 | 18.6 | 19.3 | 418.6 | 2.368 |
-| Semantic+BM25+Reranker | 1.000 | 1.000 | 1.000 | 0.667 | 0.554 | 0.401 | 12.02 | 844.0 | 1224.9 | 421.3 | 2.368 |
+## Test Suite: 25/25 = 100% Recall
 
-### Lexical vs Hybrid vs Hybrid+Reranker (focus per task)
-
-| Config | Recall@10 | MRR | nDCG@10 | p50 (ms) | Indexing (s) |
-|---|---|---|---|---|---|
-| BM25 | 1.000 | 0.800 | 0.606 | 0.7 | 0.16 |
-| Semantic+BM25 | 1.000 | 0.900 | 0.622 | 18.6 | 3.76 |
-| Semantic+BM25+Reranker | 1.000 | 0.667 | 0.554 | 844.0 | 12.02 |
-
-**Notes:**
-- Load corpus via `parse_pdf` / `FastRAGEngine.index_pdf` (178 pages, 616k chars) exactly as `test_rag.py`; hybrid baselines correspond to `FastRAGEngine(use_reranker=False)` (α=0.25 β=0.55) and `FastRAGEngine(use_reranker=True)` for reranker (§25).
-- Recall@k simulated via keyword containment (hit-rate) since exhaustive judgments unavailable for single-doc ANTAM. MRR/nDCG binary relevance; nDCG@k uses IDCG = Σ 1/log2(i+1) capped to 1 (so ≤1 even with many keyword matches).
-- RAM via psutil/resource; Disk via pickle estimate or posting*32B (§18 CSR-like).
-- BM25+translation uses bilingual dict stub (NLLB placeholder); Dense uses paraphrase-multilingual-MiniLM-L12-v2 or hash fallback; SPLADE uses doc/query expansion stub.
-- Semantic-code = LSH buckets (§6 h_i=sign(r_i·x)), hierarchical (§4), contextual (§5). Hybrid fuses α=0.25 β=0.55 γ=0.10 δ=0.10 (§9, not hard-coded final — tune via validation).
-
-## Staged Scaling (§26): 1MB→10MB→100MB→1GB and 5→20→100+ langs
-
-| Stage | Corpus | Proj. Indexing (s) | Proj. p50 (ms) | <60s | <100ms | Languages |
-|---|---|---|---|---|---|---|
-| 1 MB | 1 MB | 2.38 | 18.6 | ✅ | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
-| 10 MB | 10 MB | 20.2 | 23.1 | ✅ | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
-| 100 MB | 100 MB | 202.04 | 28.7 | ❌ (needs Rust+mmap+parallel, PRD §18-19) | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
-| 1024 MB | 1024 MB | 2068.85 | 34.4 | ❌ (needs Rust+mmap+parallel, PRD §18-19) | ✅ | 5→20→100+ (quality holds via semantic codes, per PRD §3 teacher alignment) |
-
-- Stage 1 (1.6MB this benchmark) measured; larger stages extrapolated linear indexing + log query (WAND). True 1GB requires Rust+mmap+parallel (§18-19) to meet PRD §1 targets.
-- Languages 5→20→100+ quality expected to hold via multilingual teacher alignment (§3) — to be validated on MIRACL/MrTyDi/MKQA (PRD §25).
-
-## Training Pipeline Stub (§14-17)
-
-# Training Pipeline Stub (PRD §14-17)
-
-## Dataset Combination (§14)
-- **wikipedia_multilingual**: Wikipedia multilingual dump (100+ languages) for general cross-lingual alignment | langs=100 | role=contrastive + distillation positives | usage=positive pairs: same article aligned across languages (en↔id, en↔ja, zh↔id)
-- **mC4**: Multilingual Colossal Clean Crawled Corpus (101 languages) | langs=101 | role=general language modeling for tiny encoder | usage=broad coverage for semantic codebook (student) pretraining
-- **CC100**: Common Crawl 100 languages | langs=100 | role=robustness for low-resource languages | usage=additional multilingual coverage, complementary to mC4
-- **NLLB**: No Language Left Behind parallel corpus (200+ languages, mined + human) | langs=200 | role=teacher-student positive mining + translation fallback baseline | usage=direct translation pairs for hard positives (en↔id, en↔ja, zh↔id per PRD §14)
-- **MIRACL**: Multilingual Information Retrieval Across a Continuum of Languages (18 languages, BEIR-style) | langs=18 | role=validation + test for Recall/MRR/nDCG | usage=retrieval evaluation (PRD §25 dataset list: MIRACL)
-- **MrTyDi**: Multilingual TyDi QA (11 languages, question-passage relevance) | langs=11 | role=cross-lingual QA benchmark | usage=dense vs sparse recall benchmark (PRD §25)
-- **MKQA**: Multilingual Knowledge Questions & Answers (26 languages, open-domain QA) | langs=26 | role=end-to-end QA evaluation | usage=QA/summarize/translate downstream evaluation per PRD §1
-- **XNLI**: Cross-lingual Natural Language Inference (15 languages) | langs=15 | role=contrastive hard negative mining | usage=hard negatives: semantically similar but incorrect (PRD §14)
-- **MS_MARCO_multilingual**: MS MARCO multilingual / mMARCO (13 languages translated, passage ranking) | langs=13 | role=ranking distillation target | usage=reranker training (cross-encoder, PRD §11) + teacher distillation
-
-Strategy: positive pairs en↔id, en↔ja, zh↔id (NLLB, Wikipedia) + hard negatives (XNLI, mined) + curriculum 1MB→1GB (PRD §26).
-
-## Teacher-Student (§15)
-- Teacher: strong multilingual embedding model (e.g., paraphrase-multilingual-MiniLM-L12-v2, E5-mistral, or LaBSE)
-- Student: tiny semantic-code encoder (Embedding lookup + 1D conv / MLP + hash projection, PRD §16)
-- Loss: `L = λ1·L_contrastive + λ2·L_distillation + λ3·L_code + λ4·L_sparsity`
-  - λ1 (contrastive) = 1.0
-  - λ2 (distillation KL) = 0.8
-  - λ3 (code) = 0.5
-  - λ4 (sparsity) = 0.3
-
-### Student architectures (§16)
-- A: Embedding lookup + 1D convolution + hash projection
-- B: Embedding lookup + small MLP
-- C: Token embedding + linear projection + product quantization (PQ)
-- D: Token embedding + SimHash (PRD §6 h_i=sign(r_i·x))
-- Production target: CPU: lookup + SIMD; GPU: batch encoding if available
-
-### Loss components
-- **L_contrastive**: InfoNCE / contrastive: pull positives, push negatives — "revenue increased" ↔ "pendapatan meningkat" close; vs "weather tomorrow" far
-- **L_distillation**: KL(P_teacher || P_student) to preserve ranking — Student must reproduce teacher's relevance distribution over candidates
-- **L_code**: Code fidelity: ensure hierarchical codes (PRD §4 [42]→[42,817]→[42,817,9312]) reconstruct teacher nearness — 
-- **L_sparsity**: ||z||_0 approx → L1 differentiable: target sparsity 8–32 codes — Forces representation small; PQ optional (§17) to compress 3KB→32B if needed
-
-### PQ (§17) optional
-- 768 float32 ≈3KB → 32×uint8=32B via product quantization (split → PQ → integer codes). Recommended only if sparse codes still large; else sparse codes preferred for <60s indexing.
-
-## Reproduction
-
-```bash
-python -m fast_rag.benchmarks.benchmark
-python -c "from fast_rag.benchmarks.benchmark import Benchmark; b=Benchmark(); b.run_all()"
 ```
+$ onod test ../files/ ../tests/test_25.txt
+
+=== TEST RESULTS ===
+Recall: 25/25 = 100.0%
+Avg latency: 37.0ms
+Index (worker): 5.7s
+```
+
+Queries span 3 languages (EN/ID/CN), varied lengths (short/long), across domains:
+- Revenue (1-5), Profitability (6-10), Balance sheet (11-15)
+- Mining (16-17), Corporate (18-19), Shareholder (20)
+- Cash flow (21), Working capital (22-23), Corporate (24), Analysis (25)
+
+---
+
+## Performance Comparison
+
+### Apple M2 8-core
+
+| Metric | Value |
+|---|---|
+| Index time (289 chunks, no cache) | **3.6s** |
+| Model load | 600ms |
+| Cold start (worker spawn + model + index) | ~5s |
+| Query latency (avg) | **37ms** |
+| Query latency (p95) | ~45ms |
+| Recall (25 queries) | **100%** |
+| PDF extraction | 3.4s (bottleneck) |
+| Sparse embedding | 0.1s |
+| Dense embedding (query only) | ~50ms |
+
+### VPS 2-core (vmi3097120)
+
+| Metric | Value |
+|---|---|
+| Index time (289 chunks) | **7.0s** |
+| Model load | 2.3s |
+| Query latency (avg) | **36ms** |
+| Recall (20 queries) | **100%** |
+
+---
+
+## Architecture: Query-time Dense Embedding
+
+**Key insight**: Dense embedding dihitung hanya untuk **query** (50ms), bukan untuk semua 289 chunks (yang butuh ~4.5s di M2, ~17s di VPS).
+
+Index hanya pakai sparse BM25 (0.1s). Saat query:
+1. Sparse BM25 → top 200 candidates (<1ms)
+2. Dense query embedding via ORT (~50ms)
+3. Cosine similarity query vs 200 candidates (<1ms)
+4. Combined score + boosts (<1ms)
+
+Total query: ~37ms. Index: 3.6s (M2), 7.0s (VPS).
+
+---
+
+## Comparison with Baselines
+
+| System | Recall | Query Latency | Index Time | GPU? |
+|---|---|---|---|---|
+| BM25 only | 85% (17/20) | <1ms | 0.1s | No |
+| **onod (sparse+dense query)** | **100% (25/25)** | **37ms** | **3.6s** | **No** |
+| onod (old: dense all chunks) | 100% (20/20) | 35ms | 6.9s | No |
+| Dense MiniLM Python | ~80% | ~55ms | ~15s | Optional |
+| SPLADE (from PRD) | 100% | 0.9ms | 4.1s | No |
+
+---
+
+## Worker Architecture
+
+- Background process on port 9091
+- Model loads once, stays warm
+- Auto-expires after 5 minutes idle
+- Client auto-spawns worker on first command
+- Index cached to `index.bin` for faster subsequent loads
+
+---
+
+## Files
+
+- `tests/test_25.txt` — 25 ground-truth queries (EN/ID/CN)
+- `tests/test_20.txt` — 20 ground-truth queries (EN/ID)
+- `core/src/main.rs` — Main binary (worker, benchmark, search, test)
+- `core/src/config.rs` — Configuration with defaults

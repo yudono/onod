@@ -1,0 +1,25 @@
+1. What is the total revenue of the company? -> revenue, pendapatan, 62.714
+2. Berapa total pendapatan perusahaan? -> pendapatan, revenue, 62.714
+3. Income from customer contracts? -> income, pendapatan, contracts
+4. Penghasilan bersih perusahaan berapa? -> penghasilan, bersih, net, profit
+5. Revenue from sales and services? -> revenue, penjualan, sales, services
+6. Berapa laba bruto perusahaan? -> laba, gross, profit, 10.851
+7. What is the gross profit margin? -> gross, profit, margin, laba kotor
+8. Laba bersih setelah pajak? -> laba, bersih, pajak, net profit
+9. Net profit per share? -> profit, per share, eps, laba bersih
+10. Keuntungan bersih per saham? -> keuntungan, bersih, saham, earnings
+11. Total assets of the company? -> aset, assets, total, 261
+12. What are the total liabilities? -> liabilities, utang, kewajiban, total
+13. Berapa utang jangka pendek? -> utang, loans, short-term, bank
+14. Equity attributable to shareholders? -> equity, saham, modal, shareholders
+15. Modal pemegang saham berapa? -> modal, equity, pemegang, saham
+16. Gold production volume? -> emas, gold, production, 14.944
+17. Nickel mining output in tons? -> nikel, nickel, production, ton
+18. Chief executive officer name? -> direksi, director, presiden, direktur
+19. Board of directors composition? -> direksi, director, commissioners, board
+20. Dividend payment amount? -> dividen, dividend, payment
+21. Operating cash flow total? -> arus, kas, operasi, cash, flow
+22. Trade receivables outstanding? -> piutang, receivable, trade, pelanggan
+23. Inventory balance sheet? -> persediaan, inventory, balance
+24. PT ANTAM subsidiaries list? -> ANTAM, subsidiaries, anak, perusahaan
+25. Revenue comparison 2025 vs 2026? -> revenue, pendapatan, 2025, 2026, comparison

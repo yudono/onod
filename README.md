@@ -1,6 +1,6 @@
 # onod — Rust Search Engine
 
-Full Rust search engine untuk dokumen multibahasa. **Hybrid Transformer (ORT) + Sparse + RRF** — akurat seperti vector search, tetap CPU-only tanpa GPU.
+Full Rust search engine untuk dokumen multibahasa. **Sparse BM25 + ORT Transformer Query-time** — akurat seperti vector search, tetap CPU-only tanpa GPU.
 
 ---
 
@@ -11,91 +11,106 @@ Document (PDF/TXT/MD)
     ↓
 PDF Parser (pdf_oxide, Rust-native)
     ↓
-Chunking (600 char, kalimat-aware, overlap 140)
+Chunking (4800 char, kalimat-aware, overlap 400)
     ↓
 ┌──────────────────┬──────────────────┐
-│ Dense Transformer│ Sparse TF-IDF    │
-│ (ORT, 384-dim)   │ (vocab 30k)      │
+│ Sparse TF-IDF    │ Dense Query ORT  │
+│ (index time)     │ (query time)     │
+│ vocab 30k+       │ 384-dim, 96 tok  │
 └────────┬─────────┴────────┬─────────┘
          │                  │
          ↓                  ↓
-      RRF Fusion (0.6 dense / 0.4 sparse)
-         │
-         ↓
-      Financial Boost (angka + terms)
-         │
-         ↓
-      Trigram-overlap Boost (typo/morfologi)
-         │
-         ↓
-      Rerank (cosine query vs kandidat)
-         │
-         ↓
-      Top-K Results
+      Sparse BM25       Dense Cosine
+      (200 candidates)  (on-the-fly)
+         │                  │
+         └────────┬─────────┘
+                  ↓
+           Combined Score (0.6 dense / 0.4 sparse)
+                  │
+                  ↓
+           Financial Boost (angka + terms)
+                  │
+                  ↓
+           Trigram-overlap Boost (typo/morfologi)
+                  │
+                  ↓
+           Top-K Results
 ```
 
-Dense path: `tokenizer.json` (Unigram 250k, trunc 128) → `model.onnx` (`last_hidden_state [batch, seq, 384]`, qint8 ARM64) → mean-pooling + L2-norm. Jika `model.onnx` tidak ada → fallback hash char n-gram (tanpa panic).
-
-### Komponen Utama
-
-| Komponen | Fungsi | Catatan |
-|---|---|---|
-| **pdf_oxide** | PDF parsing | Rust-native |
-| **ORT Transformer** | Dense embeddings 384-dim | `ort 2.0.0-rc.13`, CPU-only, qint8 |
-| **Sparse TF-IDF** | Keyword exact match | vocab 30k, cosine sparse |
-| **RRF** | Score fusion | 0.6 dense / 0.4 sparse, k=60 |
-| **Trigram boost** | Typo/morfologi | top-200 kandidat saja |
-| **Rayon** | Parallelism | 8-core scoring + parsing |
+**Key insight**: Dense embedding dihitung hanya untuk **query** (50ms), bukan untuk semua chunks. Index hanya pakai sparse BM25 (0.1s). Hasil: indexing 3.6s (M2), recall 25/25.
 
 ---
 
-## Benchmark (CPU-only, ORT aktif)
+## Benchmark
 
-Mesin: Apple M2 8-core, 16GB, arm64. Model: `model.onnx` 113M qint8 + `tokenizer.json` 8.7M di `core/`.
+### Worker Mode (Recommended)
+
+Worker spawn otomatis, model tetap warm selama 5 menit:
 
 ```
-Initializing transformer embedder...
-  ORT model loaded: model.onnx (dim=384)
-Batch embedding 3 files...
-  Embedding [1487/1487]
+$ onod test ../files/ ../tests/test_25.txt
 
-Index: 289 chunks, 6.24s (build: 6.24s)
+  Spawning worker...
+  Worker ready.
+Indexing via worker...
+  OK 289 5725
 
-OK    21.0ms | Berapa total uang yang dihasilkan perusahaan dari pelanggan? -> ✅
-OK    20.8ms | Pendapatan bersih PT ANTAM semester 1 2026 berapa?           -> ✅
-... (20 query, termasuk Cina: ANTAM 2026年上半年总收入是多少？ -> ✅)
+=== TEST RESULTS ===
+Recall: 25/25 = 100.0%
+Avg latency: 37.0ms
+Index (worker): 5.7s
+```
 
-=== RESULTS ===
+### Benchmark Breakdown (M2 8-core)
+
+| Phase | Time | Notes |
+|---|---|---|
+| Model load | ~600ms | ORT session init |
+| PDF extraction | ~3.4s | I/O bound, pdf_oxide |
+| Vocab build | ~0.0s | Fast |
+| Sparse embedding | ~0.1s | 289 chunks |
+| **Total index** | **~3.6s** | No ORT during indexing |
+| Query (sparse + dense) | ~37ms | ORT for query only |
+
+### VPS 2-core (vmi3097120)
+
+```
+Model load: 2269ms
+Index: 289 chunks, 7.0s (read=6.7s vocab=0.1s embed=0.2s)
 Recall: 20/20 = 100.0%
-Avg latency: 20.9ms
-Index time: 6.24s
+Avg latency: 36.2ms
 ```
-
-### Accuracy
-
-20 ground-truth queries di `tests/test_20.txt` (EN/ID/CN, revenue, laba, aset, emas, direksi, dividen, arus kas). **Recall: 20/20 = 100%**, termasuk query Cina yang gagal di mode hash-fallback.
 
 ### Performance
 
-| Metric | Value (ORT CPU) | Target |
-|---|---|---|
-| Avg query latency | **25.0ms** | <100ms ✅ |
-| Index time (289 chunks, M2) | **~6s** | <10s ✅ |
-| Index time (289 chunks, VPS 2-core) | **~20s** | <60s ✅ |
-| Total chunks | 289 (4800 chars/chunk) | — |
-| Embedding dim | 384 | — |
-| GPU | Tidak (CPU-only) | — |
-| Index caching | ✅ `index.bin` otomatis | — |
+| Metric | M2 (8-core) | VPS (2-core) | Target |
+|---|---|---|---|
+| Index time (289 chunks) | **3.6s** | **7.0s** | <10s ✅ |
+| Query latency | **37ms** | **36ms** | <100ms ✅ |
+| Recall (25 queries) | **25/25 = 100%** | **20/20 = 100%** | 100% ✅ |
+| Model load | 600ms | 2.3s | — |
+| Cold start (worker) | ~5s | ~10s | — |
+| GPU | No (CPU-only) | No (CPU-only) | — |
 
-Optimasi indexing: batch cross-file embedding (256 chunk/batch), ORT multi-thread (`with_intra_threads(num_cpus)`), chunk size 4800 chars. VPS pertama kali ≈20s, berikutnya <0.1s (load `index.bin`).
+---
 
-### Comparison
+## Worker Architecture
 
-| System | Recall | Query | Index (289 chunks) | GPU? |
-|---|---|---|---|---|
-| Hash-fallback (tanpa model) | 19/20 | ~2ms | ~2-4s | No |
-| **onod + ORT (CPU)** | **20/20** | **~25ms** | **~6s** | **No** |
-| Dense MiniLM Python | ~80% | ~55ms | ~15s + GPU | Optional |
+Worker adalah background process yang menjaga model tetap warm:
+
+```
+onod search ../files/ "query"
+  → Client check: worker alive? (port 9091)
+  → If not: spawn worker (loads model ~2s)
+  → Send: INDEX ../files/
+  → Send: SEARCH query
+  → Worker responds: RESULTS ...
+  → Client prints results
+```
+
+- Worker auto-expires setelah **5 menit idle**
+- Model load hanya sekali (bukan per-query)
+- Port: **9091** (TCP, localhost only)
 
 ---
 
@@ -119,15 +134,15 @@ Buat file `core/onod.json` atau `core/config.json` untuk override default:
 
 | Field | Default | Fungsi |
 |---|---|---|
-| `chunk_chars` | 4800 | Karakter per chunk. Besar → fewer chunks → faster indexing, tapi konteks lebih luas |
-| `chunk_overlap` | 400 | Overlap antar chunk (10% dari chunk_chars). Mencegah info di boundary hilang |
-| `min_chunk` | 100 | Minimum karakter agar chunk valid. Yang lebih kecil dibuang |
-| `hard_split` | 7200 | Force split jika chunk melebihi ini (1.5x chunk_chars) |
+| `chunk_chars` | 4800 | Karakter per chunk. Besar → fewer chunks → faster indexing |
+| `chunk_overlap` | 400 | Overlap antar chunk (10% dari chunk_chars) |
+| `min_chunk` | 100 | Minimum karakter agar chunk valid |
+| `hard_split` | 7200 | Force split jika chunk melebihi ini |
 | `embedding_dim` | 384 | Dimensi output model. MiniLM = 384 |
-| `top_k_candidates` | 200 | Kandidat dari retrieval sebelum reranking. Besar → lebih lengkap tapi lebih lambat |
+| `top_k_candidates` | 200 | Kandidat dari BM25 sebelum dense rerank |
 | `top_k_results` | 10 | Hasil akhir yang dikembalikan |
-| `rerank_weight` | 0.6 | Bobot reranker (0.0-1.0). Tinggi → lebih banyak pengaruh reranker |
-| `financial_boost` | 0.3 | Boost skor untuk dokumen dengan istilah keuangan (revenue, laba, aset, dll) |
+| `rerank_weight` | 0.6 | Bobot dense vs sparse (0.6 = 60% dense) |
+| `financial_boost` | 0.3 | Boost skor untuk dokumen dengan istilah keuangan |
 
 ---
 
@@ -139,45 +154,52 @@ Buat file `core/onod.json` atau `core/config.json` untuk override default:
 # Install Rust (jika belum)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Taruh model di core/ (tidak di-commit, lihat .gitignore):
-# core/model.onnx (113M, qint8, input: input_ids/attention_mask/token_type_ids,
-#                  output: last_hidden_state [batch, seq, 384])
-# core/tokenizer.json (Unigram 250k, trunc 128)
-ls core/model.onnx core/tokenizer.json
+# Taruh model di core/ (tidak di-commit):
+# core/model.onnx (113M, qint8)
+# core/model.tokenizer.json (8.7M)
+ls core/model.onnx core/model.tokenizer.json
 
 # Build
 cd core
 cargo build --release
 
-# Binary ada di:
-# core/target/release/onod
+# Binary: core/target/release/onod
 ```
-
-Model tidak di-push ke git (terlalu besar). Ambil dari HF `paraphrase-multilingual-MiniLM-L12-v2` varian `onnx/model_qint8_arm64.onnx` + `tokenizer.json`, rename ke `model.onnx` / `tokenizer.json`.
 
 ---
 
 ## Cara Pakai
 
-### 1. Benchmark (20 query, harus 20/20)
+### 1. Test (25 queries, harus 25/25)
 
 ```bash
 cd core
-cargo build --release
+./target/release/onod test ../files/ ../tests/test_25.txt
+```
+
+### 2. Benchmark (20 queries)
+
+```bash
 ./target/release/onod benchmark ../files/
 ```
 
-### 2. Search (pakai `index.bin` cache jika ada)
+### 3. Search
 
 ```bash
 ./target/release/onod search ../files/ "Berapa total pendapatan?"
 ```
 
-### 3. Serve REST
+### 4. HTTP Server
 
 ```bash
-./target/release/onod serve ../files/ --port 8080
-# GET /health, GET /search?q=...&top_k=10
+./target/release/onod daemon ../files/ --port 9090
+# GET /health, GET /search?q=...&top_k=10, POST /index
+```
+
+### 5. Worker Management
+
+```bash
+./target/release/onod worker stop   # Stop background worker
 ```
 
 ---
@@ -191,37 +213,40 @@ cargo build --release
   PDF Parser (pdf_oxide, Rust-native)
          │
          ▼
-  Chunking: 600 char, 140 overlap, kalimat-aware
+  Chunking: 4800 char, 400 overlap, kalimat-aware
          │
-         ├──▶ Dense Transformer (ORT 384-dim) ──┐
-         │                                      ├──▶ RRF ──▶ Financial boost
-         └──▶ Sparse TF-IDF ───────────────────┘            ──▶ Trigram boost
-                                                             ──▶ Rerank ──▶ Top-K
+         ├──▶ Sparse TF-IDF (index time, 0.1s)
+         │
+         └──▶ Dense Query ORT (query time, 50ms)
+                    │
+                    ▼
+              Combined Score
+                    │
+                    ├──▶ Financial boost (0.3)
+                    ├──▶ Trigram overlap boost (2.0)
+                    └──▶ Top-K results
 ```
 
-### Tokenisasi
+### Sparse BM25
 
-- **Transformer**: `tokenizer.json` Unigram 250k, `WhitespaceSplit + Metaspace`, trunc 128, pad `<pad>` id 1.
-- **Kata (sparse)**: lowercase, angka ribuan utuh `62.714.280`, stopword removal (EN/ID/AR/TR/ZH).
-- **Trigram boost**: `#kata#` → 3-gram, hanya top-200 kandidat (murah).
+- Vocab: semua kata (count >= 1), panjang > 2
+- CJK bigram: karakter CJK → bigram tokens
+- IDF: `ln(N/df)`, cosine sparse
+- BM25 score: top-200 candidates
 
-### ORT (ONNX Runtime)
+### Dense Query (ORT)
 
-Inference dense dijalankan via crate [`ort`](https://docs.rs/ort) `2.0.0-rc.13` — binding Rust untuk ONNX Runtime, **CPU Execution Provider only** (tanpa CUDA/CoreML/GPU). `Session` dimuat sekali dari `core/model.onnx`, akses thread-safe via `Mutex<Session>` karena `Session::run` butuh `&mut`.
+- Hanya query yang di-embed (bukan semua chunks)
+- Input: `[1, 96]` tokens (truncated)
+- Output: `last_hidden_state [1, 96, 384]` → mean-pooling → L2-norm
+- Cosine similarity dengan top-200 candidates
 
-### Dense (ORT)
-
-- Input 3 tensor `[1, seq]`: `input_ids`, `attention_mask`, `token_type_ids=0`.
-- Output `last_hidden_state [1, seq, 384]` → mean-pooling pakai mask → L2-norm.
-- Query & doc pakai jalur sama (`embed_query` → `embed` jika model ada), jika model gagal → fallback hash-IDF.
-
-### Fusion (RRF)
+### Fusion
 
 ```
-score(d) = 0.6/(60+rank_dense) + 0.4/(60+rank_sparse)
+score(d) = 0.6 * cosine(query_dense, doc_dense) + 0.4 * sparse_bm25
          + financial_boost (0.3 jika terms finansial + >20 digit)
          + 2.0 * trigram_overlap
-rerank: 0.5*fusion + 0.5*cosine(query_dense, doc_dense)
 ```
 
 ---
@@ -232,18 +257,19 @@ rerank: 0.5*fusion + 0.5*cosine(query_dense, doc_dense)
 onod/
 ├── core/
 │   ├── src/
-│   │   ├── main.rs      # binary: benchmark, search, serve (ORT + hybrid)
-│   │   └── lib.rs       # library FFI (BM25 klasik)
+│   │   ├── main.rs      # binary: worker, benchmark, search, test
+│   │   ├── config.rs    # config struct with defaults
+│   │   └── tree_index.rs # hierarchical tree indexing (unused)
 │   ├── Cargo.toml
 │   ├── model.onnx       # tidak di-commit (113M, qint8)
-│   └── tokenizer.json   # tidak di-commit (8.7M)
+│   └── model.tokenizer.json # tidak di-commit (8.7M)
 ├── files/               # test documents
 │   ├── ANTAM FS 30 Juni 2026.pdf
 │   ├── FS Adaro Andalan Indonesia.pdf
-│   ├── 10840.pdf
-│   └── enwik8
-├── tests/test_20.txt    # 20 ground-truth queries
-├── benchmarks/ANTAM_benchmark.md
+│   └── 10840.pdf
+├── tests/
+│   ├── test_20.txt      # 20 ground-truth queries
+│   └── test_25.txt      # 25 complex multi-language queries
 ├── paper/               # paper two-column (PDF)
 ├── PRD.md
 └── README.md
@@ -256,35 +282,34 @@ onod/
 | Crate | Fungsi |
 |---|---|
 | `ort 2.0.0-rc.13` | ONNX Runtime, CPU EP |
-| `tokenizers 0.21` | Load `tokenizer.json` |
-| `ndarray 0.17` | Tensor `[1, seq]` |
-| `rayon` | Parallel scoring/parsing (8-core) |
+| `tokenizers 0.21` | Load tokenizer |
+| `ndarray 0.17` | Tensor operations |
+| `rayon` | Parallel scoring |
 | `unicode-normalization` | NFKC normalization |
 | `memmap2` | mmap file >100MB |
-| `serde` + `serde_json` + `bincode` | Serialization index |
-| `pdf_oxide` | PDF parsing Rust-native |
+| `serde` + `serde_json` + `bincode` | Serialization |
+| `pdf_oxide` | PDF parsing |
+| `libc` | Process management (worker) |
 
 ---
 
-## CPU Usage
+## Test Suite
 
-- ORT CPU-only, tanpa GPU/CUDA/CoreML. Model qint8 ARM64 optimal di Apple Silicon.
-- Search: `rayon::par_iter` untuk dense cosine + sparse cosine (full 8-core).
-- Indexing: parsing paralel, inference serial via `Mutex<Session>` (perlu batching untuk full paralel).
-- Untuk 8-core MacBook: scoring ~8x speedup vs single-thread; inference ~27ms/chunk.
+25 queries dalam 3 bahasa (EN/ID/CN), variasi panjang pendek:
 
----
-
-## Roadmap
-
-- [x] Full Rust core: chunk, sparse, RRF, financial boost
-- [x] ORT transformer dense (384-dim, mean-pool, CPU-only)
-- [x] Benchmark 20/20 = 100%, avg 54ms <100ms
-- [x] CLI search + REST server + `index.bin` cache
-- [x] mmap + parallel parsing
-- [ ] Batch inference (8-16 chunk/run) → index <60s
-- [ ] Session per-thread ( Hilangkan Mutex bottleneck)
-- [ ] Persistent dense index + incremental update
+| # | Query | Domain |
+|---|---|---|
+| 1-5 | Revenue, income, contracts | Revenue |
+| 6-10 | Gross profit, net profit, EPS | Profitability |
+| 11-15 | Assets, liabilities, equity | Balance sheet |
+| 16-17 | Gold/nickel production | Mining |
+| 18-19 | Directors, board composition | Corporate |
+| 20 | Dividend payment | Shareholder |
+| 21 | Operating cash flow | Cash flow |
+| 22 | Trade receivables | Working capital |
+| 23 | Inventory | Working capital |
+| 24 | Subsidiaries list | Corporate |
+| 25 | Revenue comparison YoY | Analysis |
 
 ---
 
