@@ -175,6 +175,10 @@ cargo build --release
 - **Kata (sparse)**: lowercase, angka ribuan utuh `62.714.280`, stopword removal (EN/ID/AR/TR/ZH).
 - **Trigram boost**: `#kata#` → 3-gram, hanya top-200 kandidat (murah).
 
+### ORT (ONNX Runtime)
+
+Inference dense dijalankan via crate [`ort`](https://docs.rs/ort) `2.0.0-rc.13` — binding Rust untuk ONNX Runtime, **CPU Execution Provider only** (tanpa CUDA/CoreML/GPU). `Session` dimuat sekali dari `core/model.onnx`, akses thread-safe via `Mutex<Session>` karena `Session::run` butuh `&mut`.
+
 ### Dense (ORT)
 
 - Input 3 tensor `[1, seq]`: `input_ids`, `attention_mask`, `token_type_ids=0`.
