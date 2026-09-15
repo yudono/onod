@@ -59,16 +59,16 @@ Initializing transformer embedder...
 Batch embedding 3 files...
   Embedding [1487/1487]
 
-Index: 639 chunks, 10.42s (build: 10.42s)
+Index: 289 chunks, 6.24s (build: 6.24s)
 
-OK    26.8ms | Berapa total uang yang dihasilkan perusahaan dari pelanggan? -> ✅
-OK    24.7ms | Pendapatan bersih PT ANTAM semester 1 2026 berapa?           -> ✅
+OK    21.0ms | Berapa total uang yang dihasilkan perusahaan dari pelanggan? -> ✅
+OK    20.8ms | Pendapatan bersih PT ANTAM semester 1 2026 berapa?           -> ✅
 ... (20 query, termasuk Cina: ANTAM 2026年上半年总收入是多少？ -> ✅)
 
 === RESULTS ===
 Recall: 20/20 = 100.0%
-Avg latency: 24.8ms
-Index time: 10.42s
+Avg latency: 20.9ms
+Index time: 6.24s
 ```
 
 ### Accuracy

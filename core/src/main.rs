@@ -12,57 +12,18 @@ use ndarray::Array2;
 use ort::session::{Session, builder::SessionBuilder};
 use ort::value::Value;
 
-// ==================== CONFIG ====================
-#[derive(serde::Deserialize, serde::Serialize, Clone)]
-struct Config {
-    chunk_chars: usize,
-    chunk_overlap: usize,
-    min_chunk: usize,
-    hard_split: usize,
-    embedding_dim: usize,
-    top_k_candidates: usize,
-    top_k_results: usize,
-    rerank_weight: f64,
-    financial_boost: f64,
-}
+pub mod config;
+pub mod tree_index;
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            chunk_chars: 4800,
-            chunk_overlap: 400,
-            min_chunk: 100,
-            hard_split: 7200,
-            embedding_dim: 384,
-            top_k_candidates: 200,
-            top_k_results: 10,
-            rerank_weight: 0.6,
-            financial_boost: 0.3,
-        }
-    }
-}
-
-impl Config {
-    fn load() -> Self {
-        for path in &["onod.json", "config.json"] {
-            if let Ok(content) = fs::read_to_string(path) {
-                if let Ok(c) = serde_json::from_str::<Config>(&content) { eprintln!("Loaded config from {}", path); return c; }
-            }
-        }
-        Config::default()
-    }
-}
-
-static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
-fn get_config() -> &'static Config { CONFIG.get_or_init(|| Config::load()) }
+pub use config::get_config;
 
 // ==================== TRANSFORMER EMBEDDING ====================
 // ort hook: jika file model.onnx ada dipakai, jika tidak fallback ke hash embedding.
 // Mutex agar &self tetap bisa dipakai paralel via rayon (Session::run butuh &mut).
-struct TransformerEmbedder {
-    model: std::sync::Mutex<Option<Session>>,
-    tokenizer: tokenizers::Tokenizer,
-    dim: usize,
+pub struct TransformerEmbedder {
+    pub model: std::sync::Mutex<Option<Session>>,
+    pub tokenizer: tokenizers::Tokenizer,
+    pub dim: usize,
 }
 
 impl TransformerEmbedder {
@@ -185,7 +146,7 @@ impl TransformerEmbedder {
 
     /// Batch encode: tokenize semua teks, pad ke max_seq_len, sekali model.run().
     /// Mengembalikan Vec embedding (L2-normalized, dim-dim).
-    fn embed_batch_static(model: &mut Session, tokenizer: &tokenizers::Tokenizer, texts: &[String], dim: usize) -> Vec<Vec<f32>> {
+    pub fn embed_batch_static(model: &mut Session, tokenizer: &tokenizers::Tokenizer, texts: &[String], dim: usize) -> Vec<Vec<f32>> {
         if texts.is_empty() { return Vec::new(); }
         let encodings = match tokenizer.encode_batch(texts.to_vec(), true) {
             Ok(enc) => enc,
@@ -338,17 +299,17 @@ fn for_each_gram_idx(text: &str, dim: usize, mut f: impl FnMut(usize)) {
 }
 
 // ==================== SPARSE TEXT EMBEDDING ====================
-struct SparseEmbedder {
+pub struct SparseEmbedder {
     vocab: HashMap<String, u32>,
     idf: HashMap<String, f64>,
 }
 
 impl SparseEmbedder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { vocab: HashMap::new(), idf: HashMap::new() }
     }
     
-    fn build_vocab(&mut self, texts: &[String]) {
+    pub fn build_vocab(&mut self, texts: &[String]) {
         let mut tf: HashMap<String, usize> = HashMap::new();
         let mut df: HashMap<String, usize> = HashMap::new();
         let n = texts.len() as f64;
@@ -375,7 +336,7 @@ impl SparseEmbedder {
         }
     }
     
-    fn embed(&self, text: &str) -> HashMap<u32, f32> {
+    pub fn embed(&self, text: &str) -> HashMap<u32, f32> {
         // Sparse sejati: hanya dimensi non-zero yang disimpan.
         // 3750 docs × ~100 terms ≈ 375rb entri (vs 114jt dense) → hemat ~300x.
         let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
@@ -393,7 +354,7 @@ impl SparseEmbedder {
         sparse
     }
 
-    fn sparse_cosine(a: &HashMap<u32, f32>, b: &HashMap<u32, f32>) -> f64 {
+    pub fn sparse_cosine(a: &HashMap<u32, f32>, b: &HashMap<u32, f32>) -> f64 {
         if a.is_empty() || b.is_empty() { return 0.0; }
         let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
         let mut dot = 0.0;
@@ -408,6 +369,7 @@ impl SparseEmbedder {
 // ==================== RERANKER ====================
 // Rerank murah tanpa re-embed: memadukan skor fusion dengan cosine
 // query_dense vs dense embedding tersimpan.
+#[allow(dead_code)]
 struct Reranker;
 
 impl Reranker {
@@ -487,7 +449,7 @@ fn split_sentences(text: &str) -> Vec<String> {
     out
 }
 
-fn chunk_text(text: &str) -> Vec<(String, String)> {
+pub fn chunk_text(text: &str) -> Vec<(String, String)> {
     let cfg = get_config();
     let sentences = split_sentences(text);
     let mut chunks = Vec::new();
@@ -513,9 +475,11 @@ fn chunk_text(text: &str) -> Vec<(String, String)> {
 }
 
 // ==================== INDEX ====================
+#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Doc { content: String, source: String, page: u32, heading: String, dense_embedding: Vec<f32>, sparse_embedding: HashMap<u32, f32> }
 
+#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct OnodIndex {
     docs: Vec<Doc>,
@@ -760,7 +724,7 @@ impl OnodIndex {
     }
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     let mut dot = 0.0; let mut na = 0.0; let mut nb = 0.0;
     for i in 0..a.len().min(b.len()) { dot += a[i] as f64 * b[i] as f64; na += a[i] as f64 * a[i] as f64; nb += b[i] as f64 * b[i] as f64; }
     let norm = na.sqrt() * nb.sqrt();
@@ -768,6 +732,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[allow(dead_code)]
 struct SearchResult { doc: u32, score: f64, page: u32, source: String, heading: String, snippet: String, expanded: String }
 
 // ==================== FILE PARSING ====================
@@ -825,23 +790,23 @@ fn read_files_parallel(paths: &[PathBuf]) -> Vec<(PathBuf, io::Result<String>)> 
 }
 
 // ==================== REST SERVER ====================
-fn start_server(idx: Arc<OnodIndex>, embedder: Arc<TransformerEmbedder>, sparse_embedder: Arc<SparseEmbedder>, reranker: Arc<Reranker>, port: u16) {
+fn start_server(idx: Arc<OnodIndex>, embedder: Arc<TransformerEmbedder>, sparse_embedder: Arc<SparseEmbedder>, _reranker: Arc<Reranker>, port: u16) {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).expect("cannot bind");
     eprintln!("Server listening on http://0.0.0.0:{}", port);
-    for stream in listener.incoming() { if let Ok(s) = stream { let idx = idx.clone(); let e = embedder.clone(); let se = sparse_embedder.clone(); let r = reranker.clone(); std::thread::spawn(move || { handle_connection(s, &idx, &e, &se, &r); }); } }
+    for stream in listener.incoming() { if let Ok(s) = stream { let idx = idx.clone(); let e = embedder.clone(); let se = sparse_embedder.clone(); std::thread::spawn(move || { handle_connection(s, &idx, &e, &se); }); } }
 }
-fn handle_connection(mut stream: TcpStream, idx: &OnodIndex, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, reranker: &Reranker) {
+fn handle_connection(mut stream: TcpStream, idx: &OnodIndex, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder) {
     use std::io::{BufRead, BufReader};
     let mut buf = BufReader::new(&stream); let mut line = String::new(); buf.read_line(&mut line).unwrap();
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 { let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n"); return; }
     let resp = match parts[1] {
-        "/" => fmt(200, &serde_json::json!({"name":"onod","version":"0.6.0","architecture":"transformer+dense+sparse+rerank"}).to_string()),
+        "/" => fmt(200, &serde_json::json!({"name":"onod","version":"0.7.0","architecture":"transformer+dense+sparse+rerank"}).to_string()),
         "/health" => fmt(200, &serde_json::json!({"status":"ok","chunks":idx.docs.len()}).to_string()),
         p if p.starts_with("/search") => {
             let params: HashMap<String,String> = p.split('?').nth(1).unwrap_or("").split('&').filter_map(|p| p.split_once('=')).map(|(k,v)| (k.replace("%20"," "), v.replace("%20"," "))).collect();
             let q = params.get("q").map(|s| s.as_str()).unwrap_or(""); let top_k: usize = params.get("top_k").and_then(|s| s.parse().ok()).unwrap_or(10);
-            if q.is_empty() { fmt(400, &"{'error':'missing q'}") } else { fmt(200, &serde_json::json!({"query":q,"results":idx.search(q,embedder,sparse_embedder,reranker,top_k)}).to_string()) }
+            if q.is_empty() { fmt(400, &"{'error':'missing q'}") } else { fmt(200, &serde_json::json!({"query":q,"results":idx.search(q,embedder,sparse_embedder,&Reranker::new(),top_k)}).to_string()) }
         }
         _ => fmt(404, &"{'error':'not found'}"),
     };
@@ -853,54 +818,37 @@ fn fmt(s: u16, b: &str) -> String { format!("HTTP/1.1 {} {}\r\nContent-Type: app
 fn main() {
     let _ = get_config();
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 { eprintln!("onod v0.6.0 — Transformer Hybrid Search Engine\nUsage: onod <benchmark|search|serve|save|load> [args]"); std::process::exit(1); }
-    
-    // Initialize embedders
+    if args.len() < 2 { eprintln!("onod v0.7.0 — Transformer Hybrid Search Engine\nUsage: onod <benchmark|search|serve> [args]"); std::process::exit(1); }
+
     eprintln!("Initializing transformer embedder...");
     let embedder = Arc::new(TransformerEmbedder::new());
     let reranker = Arc::new(Reranker::new());
-    
+
     match args[1].as_str() {
         "benchmark" => {
             let folder = args.get(2).expect("provide folder");
-            let reindex = args.iter().any(|a| a == "--reindex");
             let mut idx = OnodIndex::new();
             let mut sparse = SparseEmbedder::new();
             let t0 = Instant::now();
-            let index_path = Path::new(folder).join("index.bin");
 
-            // Load index jika sudah ada dan tidak --reindex
-            if index_path.exists() && !reindex {
-                eprintln!("Loading cached index...");
-                match OnodIndex::load(&index_path) {
-                    Ok(loaded) => { idx = loaded; eprintln!("  {} chunks loaded in {:.2}s", idx.docs.len(), t0.elapsed().as_secs_f64()); }
-                    Err(e) => { eprintln!("  stale index ({}), rebuilding...", e); let _ = std::fs::remove_file(&index_path); }
+            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+            let results = read_files_parallel(&paths);
+            let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+            }).collect();
+            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+            sparse.build_vocab(&texts);
+
+            eprintln!("Batch embedding {} files...", file_texts.len());
+            idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
+                if cur == 1 || cur == tot || cur % 100 == 0 {
+                    eprint!("\r  Embedding [{}/{}]", cur, tot);
+                    if cur == tot { eprintln!(); }
                 }
-            }
+            }));
+            eprintln!("Index: {} chunks, {:.2}s\n", idx.docs.len(), t0.elapsed().as_secs_f64());
 
-            if idx.docs.is_empty() {
-                let t_index = Instant::now();
-                let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
-                let results = read_files_parallel(&paths);
-                let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
-                }).collect();
-                let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
-                sparse.build_vocab(&texts);
-
-                eprintln!("Batch embedding {} files...", file_texts.len());
-                idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
-                    if cur == 1 || cur == tot || cur % 100 == 0 {
-                        eprint!("\r  Embedding [{}/{}]", cur, tot);
-                        if cur == tot { eprintln!(); }
-                    }
-                }));
-                eprintln!("Index: {} chunks, {:.2}s (build: {:.2}s)\n", idx.docs.len(), t_index.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64());
-                let _ = idx.save(&index_path);
-            }
-            
-            // 20 Complex Test Queries
             let queries = vec![
                 ("Berapa total uang yang dihasilkan perusahaan dari pelanggan?", vec!["62.714","revenue","pendapatan"]),
                 ("Pendapatan bersih PT ANTAM semester 1 2026 berapa?", vec!["62.714","pendapatan"]),
@@ -923,7 +871,7 @@ fn main() {
                 ("Berapa selisih antara pendapatan dan beban pokok penjualan?", vec!["10.851","laba","bruto","gross"]),
                 (" ANTAM 2026年上半年总收入是多少？", vec!["62.714","revenue","pendapatan"]),
             ];
-            
+
             let mut hits = 0; let mut total_ms = 0.0;
             for (q, kws) in &queries {
                 let t1 = Instant::now();
@@ -942,33 +890,15 @@ fn main() {
             let folder = args.get(2).expect("provide folder"); let query = args.get(3..).unwrap_or(&[]).join(" ");
             if query.is_empty() { eprintln!("Usage: onod search <folder> <query>"); std::process::exit(1); }
             let mut idx = OnodIndex::new(); let mut sparse = SparseEmbedder::new();
-            let index_path = Path::new(folder).join("index.bin");
-            if index_path.exists() {
-                eprintln!("Loading index...");
-                match OnodIndex::load(&index_path) {
-                    Ok(loaded) => { idx = loaded; }
-                    Err(e) => { eprintln!("  stale index ({}), rebuilding...", e); let _ = std::fs::remove_file(&index_path); }
-                }
-            }
-            if idx.docs.is_empty() {
-                eprintln!("Building index...");
-                let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
-                let results = read_files_parallel(&paths);
-                let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
-                }).collect();
-                let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
-                sparse.build_vocab(&texts);
-                idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
-                    if cur == 1 || cur == tot || cur % 100 == 0 {
-                        eprint!("\r  Embedding [{}/{}]", cur, tot);
-                        if cur == tot { eprintln!(); }
-                    }
-                }));
-                eprintln!("Index: {} chunks", idx.docs.len());
-                let _ = idx.save(&index_path);
-            }
+            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+            let results = read_files_parallel(&paths);
+            let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+            }).collect();
+            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+            sparse.build_vocab(&texts);
+            idx.build_index_batch(&file_texts, &embedder, &sparse, None);
             let t1 = Instant::now(); let results = idx.search(&query, &embedder, &sparse, &reranker, 10); let ms = t1.elapsed().as_secs_f64() * 1000.0;
             eprintln!("Query: \"{}\"\nSearch: {:.1}ms\n", query, ms);
             for (i, r) in results.iter().enumerate() { println!("{}. [{:.4}] {} — {}", i+1, r.score, r.heading, r.snippet.chars().take(150).collect::<String>()); }
@@ -976,35 +906,22 @@ fn main() {
         "serve" => {
             let folder = args.get(2).expect("provide folder"); let port: u16 = args.iter().position(|a| a == "--port").and_then(|i| args.get(i+1)).and_then(|p| p.parse().ok()).unwrap_or(8080);
             let mut idx = OnodIndex::new(); let mut sparse = SparseEmbedder::new();
-            let index_path = Path::new(folder).join("index.bin");
-
-            // Load index jika sudah ada
-            if index_path.exists() {
-                eprintln!("Loading cached index...");
-                match OnodIndex::load(&index_path) {
-                    Ok(loaded) => { idx = loaded; eprintln!("  {} chunks loaded", idx.docs.len()); }
-                    Err(e) => { eprintln!("  stale index ({}), rebuilding...", e); let _ = std::fs::remove_file(&index_path); }
+            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+            let results = read_files_parallel(&paths);
+            let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+            }).collect();
+            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+            sparse.build_vocab(&texts);
+            eprintln!("Batch embedding {} files...", file_texts.len());
+            idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
+                if cur == 1 || cur == tot || cur % 100 == 0 {
+                    eprint!("\r  Embedding [{}/{}]", cur, tot);
+                    if cur == tot { eprintln!(); }
                 }
-            }
-
-            if idx.docs.is_empty() {
-                eprintln!("Building index..."); let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
-                let results = read_files_parallel(&paths);
-                let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
-                }).collect();
-                let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
-                sparse.build_vocab(&texts);
-                idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
-                    if cur == 1 || cur == tot || cur % 100 == 0 {
-                        eprint!("\r  Embedding [{}/{}]", cur, tot);
-                        if cur == tot { eprintln!(); }
-                    }
-                }));
-                eprintln!("Index: {} chunks", idx.docs.len());
-                let _ = idx.save(&index_path);
-            }
+            }));
+            eprintln!("Index: {} chunks ready", idx.docs.len());
             let idx = Arc::new(idx);
             let sparse = Arc::new(sparse);
             start_server(idx, embedder, sparse, reranker, port);
