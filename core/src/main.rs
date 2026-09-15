@@ -490,6 +490,7 @@ struct OnodIndex {
     dim_df: Vec<u32>,
 }
 
+#[allow(dead_code)]
 impl OnodIndex {
     fn new() -> Self {
         let dim = get_config().embedding_dim;

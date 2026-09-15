@@ -41,7 +41,7 @@ impl TreeIndex {
         let mut para_buf: Vec<String> = Vec::new();
         let mut current_heading = String::new();
 
-        let mut flush_para = |buf: &mut Vec<String>, heading: &str, nodes: &mut Vec<TreeNode>, stack: &[(u8, u32)]| {
+        let flush_para = |buf: &mut Vec<String>, heading: &str, nodes: &mut Vec<TreeNode>, stack: &[(u8, u32)]| {
             if buf.is_empty() { return; }
             let text = buf.join(" ");
             if text.len() < cfg.min_chunk { buf.clear(); return; }
