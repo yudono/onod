@@ -715,13 +715,13 @@ impl OnodIndex {
         reranker.rerank(&query_dense, &candidates, &self.docs, top_k)
     }
 
-    fn save(&self, path: &Path) -> io::Result<()> {
+    pub fn save(&self, path: &Path) -> io::Result<()> {
         let file = fs::File::create(path)?;
         let mut writer = io::BufWriter::new(file);
         bincode::serialize_into(&mut writer, self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 
-    fn load(path: &Path) -> io::Result<Self> {
+    pub fn load(path: &Path) -> io::Result<Self> {
         let file = fs::File::open(path)?;
         let mut reader = io::BufReader::new(file);
         bincode::deserialize_from(&mut reader).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
@@ -831,27 +831,59 @@ fn main() {
     match args[1].as_str() {
         "benchmark" => {
             let folder = args.get(2).expect("provide folder");
+            let no_cache = args.iter().any(|a| a == "--no-cache");
+            let cache_path = std::path::Path::new(folder).join("index.bin");
             let mut idx = OnodIndex::new();
             let mut sparse = SparseEmbedder::new();
             let t0 = Instant::now();
 
-            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
-            let results = read_files_parallel(&paths);
-            let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
-                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
-            }).collect();
-            let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
-            sparse.build_vocab(&texts);
-
-            eprintln!("Batch embedding {} files...", file_texts.len());
-            idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
-                if cur == 1 || cur == tot || cur % 100 == 0 {
-                    eprint!("\r  Embedding [{}/{}]", cur, tot);
-                    if cur == tot { eprintln!(); }
+            // Try load cache
+            if !no_cache && cache_path.exists() {
+                match OnodIndex::load(&cache_path) {
+                    Ok(loaded) => {
+                        idx = loaded;
+                        eprintln!("Loaded cached index: {} chunks in {:.2}s\n", idx.docs.len(), t0.elapsed().as_secs_f64());
+                    }
+                    Err(_) => {
+                        // cache corrupt, rebuild
+                        let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+                        let results = read_files_parallel(&paths);
+                        let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+                            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+                        }).collect();
+                        let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+                        sparse.build_vocab(&texts);
+                        eprintln!("Batch embedding {} files...", file_texts.len());
+                        idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
+                            if cur == 1 || cur == tot || cur % 100 == 0 {
+                                eprint!("\r  Embedding [{}/{}]", cur, tot);
+                                if cur == tot { eprintln!(); }
+                            }
+                        }));
+                        let _ = idx.save(&cache_path);
+                        eprintln!("Index: {} chunks, {:.2}s (cached)\n", idx.docs.len(), t0.elapsed().as_secs_f64());
+                    }
                 }
-            }));
-            eprintln!("Index: {} chunks, {:.2}s\n", idx.docs.len(), t0.elapsed().as_secs_f64());
+            } else {
+                let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+                let results = read_files_parallel(&paths);
+                let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+                }).collect();
+                let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+                sparse.build_vocab(&texts);
+                eprintln!("Batch embedding {} files...", file_texts.len());
+                idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
+                    if cur == 1 || cur == tot || cur % 100 == 0 {
+                        eprint!("\r  Embedding [{}/{}]", cur, tot);
+                        if cur == tot { eprintln!(); }
+                    }
+                }));
+                let _ = idx.save(&cache_path);
+                eprintln!("Index: {} chunks, {:.2}s (cached)\n", idx.docs.len(), t0.elapsed().as_secs_f64());
+            }
 
             let queries = vec![
                 ("Berapa total uang yang dihasilkan perusahaan dari pelanggan?", vec!["62.714","revenue","pendapatan"]),
