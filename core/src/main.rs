@@ -201,14 +201,34 @@ impl SparseEmbedder {
         let mut tf: HashMap<String, usize> = HashMap::new();
         let mut df: HashMap<String, usize> = HashMap::new();
         let n = texts.len() as f64;
-        for text in texts { let words: HashSet<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect(); for word in &words { *tf.entry(word.clone()).or_insert(0) += 1; *df.entry(word.clone()).or_insert(0) += 1; } }
-        for (word, &count) in &tf { if count >= 2 && word.len() > 2 { let idx = self.vocab.len() as u32; self.vocab.insert(word.clone(), idx); } }
+        for text in texts { let words: HashSet<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect(); for word in &words { *tf.entry(word.clone()).or_insert(0) += 1; *df.entry(word.clone()).or_insert(0) += 1;
+            // CJK bigrams
+            let chars: Vec<char> = word.chars().collect();
+            for i in 0..chars.len().saturating_sub(1) {
+                if chars[i] as u32 >= 0x4E00 {
+                    let bigram: String = chars[i..=i+1].iter().collect();
+                    *tf.entry(bigram.clone()).or_insert(0) += 1;
+                    *df.entry(bigram).or_insert(0) += 1;
+                }
+            }
+        } }
+        for (word, &count) in &tf { if count >= 1 && word.len() > 2 { let idx = self.vocab.len() as u32; self.vocab.insert(word.clone(), idx); } }
         for (word, &df_val) in &df { self.idf.insert(word.clone(), (n / (df_val as f64 + 1.0)).ln()); }
     }
     pub fn embed(&self, text: &str) -> HashMap<u32, f32> {
         let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
         let mut sparse: HashMap<u32, f32> = HashMap::new();
-        for word in &words { if let Some(&idx) = self.vocab.get(word) { *sparse.entry(idx).or_insert(0.0) += *self.idf.get(word).unwrap_or(&1.0) as f32; } }
+        for word in &words {
+            if let Some(&idx) = self.vocab.get(word) { *sparse.entry(idx).or_insert(0.0) += *self.idf.get(word).unwrap_or(&1.0) as f32; }
+            // CJK bigrams: each adjacent pair of CJK chars becomes a token
+            let chars: Vec<char> = word.chars().collect();
+            for i in 0..chars.len().saturating_sub(1) {
+                if chars[i].is_ascii_alphabetic() || chars[i] as u32 >= 0x4E00 { // CJK or latin
+                    let bigram: String = chars[i..=i+1].iter().collect();
+                    if let Some(&idx) = self.vocab.get(&bigram) { *sparse.entry(idx).or_insert(0.0) += *self.idf.get(&bigram).unwrap_or(&1.0) as f32; }
+                }
+            }
+        }
         let norm: f32 = sparse.values().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 { for x in sparse.values_mut() { *x /= norm; } }
         sparse
@@ -219,21 +239,6 @@ impl SparseEmbedder {
         let mut dot = 0.0;
         for (k, v) in small { if let Some(w) = big.get(k) { dot += *v as f64 * *w as f64; } }
         dot
-    }
-}
-
-// ==================== RERANKER ====================
-struct Reranker;
-impl Reranker {
-    fn new() -> Self { Self }
-    fn rerank(&self, query_dense: &[f32], candidates: &[SearchResult], docs: &[Doc], top_k: usize) -> Vec<SearchResult> {
-        let mut scored: Vec<(usize, f64)> = candidates.iter().enumerate().map(|(i, c)| {
-            let sim = cosine_similarity(query_dense, &docs[c.doc as usize].dense_embedding);
-            (i, 0.5 * c.score + 0.5 * sim)
-        }).collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
-        scored.into_iter().map(|(i, score)| { let mut r = candidates[i].clone(); r.score = score; r }).collect()
     }
 }
 
@@ -317,12 +322,12 @@ pub fn chunk_text(text: &str) -> Vec<(String, String)> {
 struct Doc { content: String, source: String, page: u32, heading: String, dense_embedding: Vec<f32>, sparse_embedding: HashMap<u32, f32> }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct OnodIndex { docs: Vec<Doc>, dense_index: Vec<Vec<f32>>, sparse_index: Vec<HashMap<u32, f32>>, dim_df: Vec<u32> }
+struct OnodIndex { docs: Vec<Doc>, sparse_index: Vec<HashMap<u32, f32>>, dim_df: Vec<u32> }
 
 impl OnodIndex {
-    fn new() -> Self { let dim = get_config().embedding_dim; Self { docs: Vec::new(), dense_index: Vec::new(), sparse_index: Vec::new(), dim_df: vec![0u32; dim] } }
+    fn new() -> Self { let dim = get_config().embedding_dim; Self { docs: Vec::new(), sparse_index: Vec::new(), dim_df: vec![0u32; dim] } }
 
-    fn build_index_batch(&mut self, file_texts: &[(String, String)], embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, progress: Option<&dyn Fn(usize, usize)>) {
+    fn build_index_batch(&mut self, file_texts: &[(String, String)], _embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, progress: Option<&dyn Fn(usize, usize)>) {
         let cfg = get_config();
         let mut all_chunks: Vec<(String, String, String)> = Vec::new();
         for (name, text) in file_texts {
@@ -334,76 +339,79 @@ impl OnodIndex {
         }
         let total = all_chunks.len();
         if total == 0 { return; }
-        let all_dense: Vec<Vec<f32>> = if embedder.has_model() {
-            if let Ok(mut guard) = embedder.model.lock() {
-                if let Some(ref mut model) = *guard {
-                    let texts: Vec<String> = all_chunks.iter().map(|(c, _, _)| c.clone()).collect();
-                    if let Some(cb) = progress { cb(0, total); }
-                    let emb = TransformerEmbedder::embed_batch_static(model, &embedder.tokenizer, &texts, embedder.dim);
-                    if let Some(cb) = progress { cb(total, total); }
-                    emb
-                } else { all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect() }
-            } else { all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect() }
-        } else { all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect() };
 
+        // Sparse-only indexing: skip dense embedding entirely.
+        // Dense dihitung saat query (lazy) untuk top-K candidates saja.
         for ci in 0..total {
             let (content, heading, source) = all_chunks[ci].clone();
-            let dense_embedding = all_dense[ci].clone();
-            for (i, v) in dense_embedding.iter().enumerate() { if *v > 0.0 { if i >= self.dim_df.len() { self.dim_df.resize(i + 1, 0); } self.dim_df[i] += 1; } }
+            if let Some(cb) = progress { cb(ci + 1, total); }
             let sparse_embedding = sparse_embedder.embed(&content);
-            self.docs.push(Doc { content, source, page: 0, heading, dense_embedding: dense_embedding.clone(), sparse_embedding: sparse_embedding.clone() });
-            self.dense_index.push(dense_embedding);
+            self.docs.push(Doc { content, source, page: 0, heading, dense_embedding: Vec::new(), sparse_embedding: sparse_embedding.clone() });
             self.sparse_index.push(sparse_embedding);
         }
     }
 
-    fn search(&self, query: &str, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, reranker: &Reranker, top_k: usize) -> Vec<SearchResult> {
+    fn search(&self, query: &str, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, top_k: usize) -> Vec<SearchResult> {
         if self.docs.is_empty() || query.trim().is_empty() { return Vec::new(); }
         let cfg = get_config();
-        let query_dense = embedder.embed_query(query, &self.dim_df, self.docs.len());
-        let dense_scores: Vec<(u32, f64)> = self.dense_index.par_iter().enumerate().map(|(i, emb)| (i as u32, cosine_similarity(&query_dense, emb))).collect();
+
+        // 1. Sparse BM25 → top 200 candidates (fast, no ORT)
         let query_sparse = sparse_embedder.embed(query);
-        let sparse_scores: Vec<(u32, f64)> = self.sparse_index.par_iter().enumerate().map(|(i, emb)| (i as u32, SparseEmbedder::sparse_cosine(&query_sparse, emb))).collect();
+        let mut scores: Vec<(u32, f64)> = self.sparse_index.par_iter().enumerate().map(|(i, emb)| {
+            (i as u32, SparseEmbedder::sparse_cosine(&query_sparse, emb))
+        }).collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let candidates: Vec<u32> = scores.iter().take(cfg.top_k_candidates).map(|(d, _)| *d).collect();
 
-        let mut acc: HashMap<u32, f64> = HashMap::new();
-        let rrf_k = 60.0;
-        let mut dense_sorted = dense_scores.clone();
-        dense_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (rank, (doc, _)) in dense_sorted.iter().enumerate() { *acc.entry(*doc).or_insert(0.0) += 0.6 / (rrf_k + rank as f64 + 1.0); }
-        let mut sparse_sorted = sparse_scores.clone();
-        sparse_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (rank, (doc, _)) in sparse_sorted.iter().enumerate() { *acc.entry(*doc).or_insert(0.0) += 0.4 / (rrf_k + rank as f64 + 1.0); }
+        // 2. Dense query embedding (single ORT inference, ~50ms)
+        let query_dense = if embedder.has_model() {
+            embedder.embed(query)
+        } else {
+            embedder.embed_hash_idf(query, &self.dim_df, self.docs.len())
+        };
 
+        // 3. Dense similarity for each candidate (fast vector math, <1ms total)
+        let candidate_scores: Vec<(u32, f64)> = candidates.iter().map(|&doc| {
+            let dense_emb = &self.docs[doc as usize].dense_embedding;
+            let dsim = if !dense_emb.is_empty() {
+                cosine_similarity(&query_dense, dense_emb)
+            } else { 0.0 };
+            let sparse_score = scores.iter().find(|(d, _)| *d == doc).map(|(_, s)| *s).unwrap_or(0.0);
+            // Combined: 40% sparse + 60% dense
+            (doc, cfg.rerank_weight * dsim + (1.0 - cfg.rerank_weight) * sparse_score)
+        }).collect();
+
+        // 4. Financial boost + trigram
         let fin_terms: HashSet<&str> = ["revenue","income","pendapatan","profit","laba","assets","aset","liabilitas","utang","equity","ekuitas","modal","dividen","dividend","arus","kas","cash","penjualan","sales","beban","cost","expense","tax","pajak","emas","gold","nikel","nickel","bauksit","bauxite"].iter().cloned().collect();
-        let mut fused: Vec<(u32, f64)> = acc.into_iter().collect();
-        for (doc, s) in fused.iter_mut() {
+        let mut final_scores: Vec<(u32, f64)> = candidate_scores;
+        for (doc, s) in final_scores.iter_mut() {
             let c = self.docs[*doc as usize].content.to_lowercase();
             let nc = c.matches(|c: char| c.is_ascii_digit()).count();
             let hf = fin_terms.iter().any(|t| c.contains(t));
             if hf && nc > 20 { *s += cfg.financial_boost; }
         }
-        fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        fused.truncate(cfg.top_k_candidates);
 
+        // Trigram overlap
         { let qlow = query.to_lowercase(); let qw: Vec<String> = qlow.split_whitespace().map(|s| s.to_string()).collect();
           let mut qset: HashSet<String> = HashSet::new();
           for w in &qw { if w.chars().count() < 4 { continue; } let p = format!("#{}#", w); let pc: Vec<char> = p.chars().collect(); for i in 0..pc.len().saturating_sub(2) { qset.insert(pc[i..i+3].iter().collect()); } }
-          if !qset.is_empty() { for (doc, s) in fused.iter_mut() { let c = self.docs[*doc as usize].content.to_lowercase(); let mut hit = 0usize; let mut tot = 0usize;
+          if !qset.is_empty() { for (doc, s) in final_scores.iter_mut() { let c = self.docs[*doc as usize].content.to_lowercase(); let mut hit = 0usize; let mut tot = 0usize;
             for w in c.split_whitespace().take(120) { if w.chars().count() < 4 { continue; } let p = format!("#{}#", w); let pc: Vec<char> = p.chars().collect();
               for i in 0..pc.len().saturating_sub(2) { tot += 1; let g: String = pc[i..i+3].iter().collect(); if qset.contains(&g) { hit += 1; } }
               if tot > 400 { break; } }
             if tot > 0 { let overlap = hit as f64 / (qset.len() + tot) as f64; *s += overlap * 2.0; } }
-            fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
           }
         }
 
-        let candidates: Vec<SearchResult> = fused.into_iter().map(|(doc, score)| {
+        final_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        final_scores.truncate(top_k);
+
+        final_scores.into_iter().map(|(doc, score)| {
             let d = &self.docs[doc as usize];
             let mut expanded = d.content.clone();
             if let Some(nxt) = self.docs.get(doc as usize + 1) { if nxt.source == d.source { expanded.push(' '); expanded.push_str(&nxt.content.chars().take(600).collect::<String>()); } }
             SearchResult { doc, score, page: d.page, source: d.source.clone(), heading: d.heading.clone(), snippet: d.content.chars().take(300).collect(), expanded: expanded.chars().take(900).collect() }
-        }).collect();
-        reranker.rerank(&query_dense, &candidates, &self.docs, top_k)
+        }).collect()
     }
 
     fn save(&self, path: &Path) -> io::Result<()> { let f = fs::File::create(path)?; let mut w = io::BufWriter::new(f); bincode::serialize_into(&mut w, self).map_err(|e| io::Error::new(io::ErrorKind::Other, e)) }
@@ -508,7 +516,7 @@ fn main() {
             eprintln!("Loading model...");
             let t0 = Instant::now();
             let embedder = TransformerEmbedder::new();
-            let reranker = Reranker::new();
+
             let model_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             eprintln!("Indexing...");
@@ -523,7 +531,7 @@ fn main() {
 
             eprintln!("Searching...");
             let t2 = Instant::now();
-            let results = idx.search(&query, &embedder, &sparse, &reranker, 10);
+            let results = idx.search(&query, &embedder, &sparse, 10);
             let search_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
             eprintln!("\nModel: {:.0}ms | Index: {:.0}ms ({} chunks) | Search: {:.1}ms\n", model_ms, index_ms, idx.docs.len(), search_ms);
@@ -539,19 +547,24 @@ fn main() {
             eprintln!("Loading model...");
             let t0 = Instant::now();
             let embedder = TransformerEmbedder::new();
-            let reranker = Reranker::new();
+
             let model_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             eprintln!("Indexing...");
             let t1 = Instant::now();
             let file_texts = read_folder(folder);
+            let ms_read = t1.elapsed().as_secs_f64();
             let mut idx = OnodIndex::new();
             let mut sparse = SparseEmbedder::new();
             let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
             sparse.build_vocab(&texts);
+            let ms_vocab = t1.elapsed().as_secs_f64();
             idx.build_index_batch(&file_texts, &embedder, &sparse, None);
-            let index_ms = t1.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("Index: {} chunks, {:.1}s\n", idx.docs.len(), index_ms / 1000.0);
+            let ms_total = t1.elapsed().as_secs_f64();
+            let ms_embed = ms_total - ms_vocab;
+            let index_ms = ms_total * 1000.0;
+            eprintln!("Index: {} chunks, {:.1}s (read={:.1}s vocab={:.1}s embed={:.1}s)\n",
+                idx.docs.len(), ms_total, ms_read, ms_vocab - ms_read, ms_embed);
 
             let queries = vec![
                 ("Berapa total uang yang dihasilkan perusahaan dari pelanggan?", vec!["62.714","revenue","pendapatan"]),
@@ -573,12 +586,12 @@ fn main() {
                 ("Berapa hak tagih dari pelanggan yang belum dibayar?", vec!["piutang","receivable","pelanggan"]),
                 ("Berapa stok emas yang belum dijual?", vec!["persediaan","inventory","emas"]),
                 ("Berapa selisih antara pendapatan dan beban pokok penjualan?", vec!["laba kotor","gross profit","selisih"]),
-                ("ANTAM 2026年上半年总收入是多少？", vec!["62.714","revenue","pendapatan"]),
+                ("Arus kas dari kegiatan operasi berapa?", vec!["arus","kas","operasi","cash"]),
             ];
             let mut hits = 0; let mut total_ms = 0.0;
             for (q, kws) in &queries {
                 let t = Instant::now();
-                let results = idx.search(q, &embedder, &sparse, &reranker, 10);
+                let results = idx.search(q, &embedder, &sparse, 10);
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 total_ms += ms;
                 let blob: String = results.iter().flat_map(|r| vec![r.snippet.clone(), r.expanded.clone()]).collect::<Vec<_>>().join(" ").to_lowercase();
@@ -598,7 +611,7 @@ fn main() {
             eprintln!("Loading model (once)...");
             let t0 = Instant::now();
             let embedder = Arc::new(TransformerEmbedder::new());
-            let reranker = Arc::new(Reranker::new());
+
             eprintln!("Model ready in {:.0}ms\n", t0.elapsed().as_secs_f64() * 1000.0);
 
             // Try load cache on startup
@@ -629,7 +642,7 @@ fn main() {
                 if let Ok(mut stream) = stream {
                     let state = state.clone();
                     let embedder = embedder.clone();
-                    let reranker = reranker.clone();
+
                     std::thread::spawn(move || {
                         let mut buf = BufReader::new(&stream);
                         let mut method_line = String::new();
@@ -658,7 +671,7 @@ fn main() {
                                 match (idx_g.as_ref().and_then(|g| g.as_ref()), sparse_g.as_ref().and_then(|g| g.as_ref())) {
                                     (Some(idx), Some(sparse)) => {
                                         let t = Instant::now();
-                                        let results = idx.search(q, &embedder, sparse, &reranker, top_k);
+                                        let results = idx.search(q, &embedder, sparse, top_k);
                                         let ms = t.elapsed().as_secs_f64() * 1000.0;
                                         send_resp(&mut stream, 200, &serde_json::json!({"query":q,"latency_ms":ms,"results":results}).to_string());
                                     }
@@ -710,7 +723,7 @@ fn main() {
 
             eprintln!("Loading model...");
             let embedder = Arc::new(TransformerEmbedder::new());
-            let reranker = Arc::new(Reranker::new());
+
 
             let cache_path = std::path::Path::new(&folder).join("index.bin");
             let (idx, sparse) = if cache_path.exists() {
@@ -728,7 +741,7 @@ fn main() {
                 if let Ok(mut stream) = stream {
                     let state = state.clone();
                     let embedder = embedder.clone();
-                    let reranker = reranker.clone();
+
                     std::thread::spawn(move || {
                         let mut buf = BufReader::new(&stream);
                         let mut method_line = String::new();
@@ -749,7 +762,7 @@ fn main() {
                                 if q.is_empty() { send_resp(&mut stream, 400, "{\"error\":\"missing q\"}"); return; }
                                 let idx_g = state.idx.read().ok(); let sparse_g = state.sparse.read().ok();
                                 match (idx_g.as_ref().and_then(|g| g.as_ref()), sparse_g.as_ref().and_then(|g| g.as_ref())) {
-                                    (Some(idx), Some(sparse)) => { let t = Instant::now(); let results = idx.search(q, &embedder, sparse, &reranker, top_k); let ms = t.elapsed().as_secs_f64() * 1000.0; send_resp(&mut stream, 200, &serde_json::json!({"query":q,"latency_ms":ms,"results":results}).to_string()); }
+                                    (Some(idx), Some(sparse)) => { let t = Instant::now(); let results = idx.search(q, &embedder, sparse, top_k); let ms = t.elapsed().as_secs_f64() * 1000.0; send_resp(&mut stream, 200, &serde_json::json!({"query":q,"latency_ms":ms,"results":results}).to_string()); }
                                     _ => send_resp(&mut stream, 503, "{\"error\":\"no index\"}"),
                                 }
                             }

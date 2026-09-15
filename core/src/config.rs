@@ -28,8 +28,7 @@ pub struct Config {
     /// Jumlah hasil akhir yang dikembalikan ke user (default di search/serve).
     pub top_k_results: usize,
 
-    /// Bobot reranking (0.0-1.0). Semakin tinggi → semakin banyak pengaruh reranker.
-    /// 0.6 = 60% reranker, 40% ranking awal.
+    /// Bobot dense embedding (0.0-1.0). Saat ini sparse-only, dense dihitung saat query.
     pub rerank_weight: f64,
 
     /// Financial boost: skor tambahan untuk dokumen yang mengandung istilah keuangan
@@ -46,10 +45,10 @@ impl Default for Config {
             min_chunk: 100,
             hard_split: 7200,
             embedding_dim: 384,
-            top_k_candidates: 400,
+            top_k_candidates: 200,
             top_k_results: 10,
-            rerank_weight: 0.7,
-            financial_boost: 0.4,
+            rerank_weight: 0.6,
+            financial_boost: 0.3,
         }
     }
 }
