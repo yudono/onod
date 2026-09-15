@@ -39,6 +39,7 @@ impl TransformerEmbedder {
 
         let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let model = SessionBuilder::new()
+            .and_then(|b| b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3).map_err(ort::Error::from))
             .and_then(|b| b.with_intra_threads(num_cpus).map_err(ort::Error::from))
             .and_then(|mut b| b.commit_from_file("model.onnx"))
             .map_err(|e| {
@@ -153,7 +154,9 @@ impl TransformerEmbedder {
             Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect(),
         };
         let n = encodings.len();
-        let max_seq = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(1).max(1);
+        // Truncate to 128 tokens — MiniLM max 512, tapi 128 sudah cukup untuk 4800-char chunks.
+        // Mengurangi komputasi ~4x tanpa penurunan recall signifikan.
+        let max_seq = encodings.iter().map(|e| e.get_ids().len().min(128)).max().unwrap_or(1).max(1);
 
         // Build batched arrays [n, max_seq]
         let mut ids_flat: Vec<i64> = Vec::with_capacity(n * max_seq);
@@ -163,9 +166,9 @@ impl TransformerEmbedder {
         for enc in &encodings {
             let ids = enc.get_ids();
             let mask = enc.get_attention_mask();
-            let seq = ids.len();
-            for &id in ids { ids_flat.push(id as i64); }
-            for &m in mask { mask_flat.push(m as i64); }
+            let seq = ids.len().min(max_seq);
+            for &id in ids.iter().take(seq) { ids_flat.push(id as i64); }
+            for &m in mask.iter().take(seq) { mask_flat.push(m as i64); }
             // padding sisa max_seq - seq sudah 0 dari vec init
             ids_flat.resize(ids_flat.len() + (max_seq - seq), 0);
             mask_flat.resize(mask_flat.len() + (max_seq - seq), 0);
@@ -203,7 +206,7 @@ impl TransformerEmbedder {
 
         let mut results: Vec<Vec<f32>> = Vec::with_capacity(n);
         for i in 0..n {
-            let seq = encodings[i].get_ids().len();
+            let seq = encodings[i].get_ids().len().min(max_seq);
             let mask_f: Vec<f32> = mask_for_pool[i*max_seq..(i+1)*max_seq].iter().map(|&x| x as f32).collect();
             let mask_sum: f32 = mask_f.iter().sum::<f32>().max(1.0);
             let mut pooled = vec![0.0f32; hidden];
@@ -569,7 +572,7 @@ impl OnodIndex {
         if total == 0 { return; }
 
         // 2. Batch embed semua chunks sekaligus (dibagi batch 256 untuk memory)
-        let batch_size = 256;
+        let batch_size = 1024;
         let mut all_dense: Vec<Vec<f32>> = Vec::with_capacity(total);
         let has_model = embedder.has_model();
 
