@@ -210,7 +210,7 @@ onod/
 │   └── enwik8
 ├── tests/test_20.txt    # 20 ground-truth queries
 ├── benchmarks/ANTAM_benchmark.md
-├── paper/               # paper two-column + generate_paper.py
+├── paper/               # paper two-column (PDF)
 ├── PRD.md
 └── README.md
 ```
