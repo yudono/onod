@@ -59,17 +59,16 @@ Initializing transformer embedder...
 Batch embedding 3 files...
   Embedding [1487/1487]
 
-Index: 1487 chunks, 24.67s (build: 24.67s)
+Index: 639 chunks, 10.42s (build: 10.42s)
 
-OK    46.8ms | Berapa total uang yang dihasilkan perusahaan dari pelanggan? -> ✅
-OK    48.7ms | Pendapatan bersih PT ANTAM semester 1 2026 berapa?           -> ✅
-OK    53.8ms | How much money did the company earn from customer contracts? -> ✅
+OK    26.8ms | Berapa total uang yang dihasilkan perusahaan dari pelanggan? -> ✅
+OK    24.7ms | Pendapatan bersih PT ANTAM semester 1 2026 berapa?           -> ✅
 ... (20 query, termasuk Cina: ANTAM 2026年上半年总收入是多少？ -> ✅)
 
 === RESULTS ===
 Recall: 20/20 = 100.0%
-Avg latency: 43.9ms
-Index time: 25.57s
+Avg latency: 24.8ms
+Index time: 10.42s
 ```
 
 ### Accuracy
@@ -80,23 +79,23 @@ Index time: 25.57s
 
 | Metric | Value (ORT CPU) | Target |
 |---|---|---|
-| Avg query latency | **43.9ms** | <100ms ✅ |
-| Min / Max query | **34.7 / 53.8ms** | <100ms ✅ |
-| Index time (1487 chunks, M2) | **~25s** | <60s ✅ |
-| Index time (1487 chunks, VPS) | **~80-100s** | — |
-| Total chunks | 1487 (1200 chars/chunk) | — |
+| Avg query latency | **24.8ms** | <100ms ✅ |
+| Min / Max query | **22.1 / 28.4ms** | <100ms ✅ |
+| Index time (639 chunks, M2) | **~10s** | <60s ✅ |
+| Index time (639 chunks, VPS 2-core) | **~30-40s** | <60s ✅ |
+| Total chunks | 639 (2400 chars/chunk) | — |
 | Embedding dim | 384 | — |
 | GPU | Tidak (CPU-only) | — |
 | Index caching | ✅ `index.bin` otomatis | — |
 
-Optimasi indexing: batch cross-file embedding (256 chunk/batch), ORT multi-thread (`with_intra_threads(num_cpus)`), chunk size 1200 chars (sebelumnya 600). VPS pertama kali ≈80-100s, berikutnya <0.1s (load `index.bin`).
+Optimasi indexing: batch cross-file embedding (256 chunk/batch), ORT multi-thread (`with_intra_threads(num_cpus)`), chunk size 2400 chars. VPS pertama kali ≈30-40s, berikutnya <0.1s (load `index.bin`).
 
 ### Comparison
 
-| System | Recall | Query | Index (1487 chunks) | GPU? |
+| System | Recall | Query | Index (639 chunks) | GPU? |
 |---|---|---|---|---|
-| Hash-fallback (tanpa model) | 19/20 | ~2ms | ~2-8s | No |
-| **onod + ORT (CPU)** | **20/20** | **~44ms** | **~25s** | **No** |
+| Hash-fallback (tanpa model) | 19/20 | ~2ms | ~2-4s | No |
+| **onod + ORT (CPU)** | **20/20** | **~25ms** | **~10s** | **No** |
 | Dense MiniLM Python | ~80% | ~55ms | ~15s + GPU | Optional |
 
 ---
