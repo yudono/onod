@@ -29,10 +29,10 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            chunk_chars: 600,
-            chunk_overlap: 140,
+            chunk_chars: 1200,
+            chunk_overlap: 200,
             min_chunk: 100,
-            hard_split: 900,
+            hard_split: 1800,
             embedding_dim: 384,
             top_k_candidates: 200,
             top_k_results: 10,
@@ -76,7 +76,9 @@ impl TransformerEmbedder {
                 tokenizers::Tokenizer::new(tokenizers::models::wordpiece::WordPiece::default())
             });
 
+        let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let model = SessionBuilder::new()
+            .and_then(|b| b.with_intra_threads(num_cpus).map_err(ort::Error::from))
             .and_then(|mut b| b.commit_from_file("model.onnx"))
             .map_err(|e| {
                 eprintln!("  WARNING: model.onnx gagal dimuat ({}), fallback hash embedding", e);
@@ -179,6 +181,95 @@ impl TransformerEmbedder {
             pooled.resize(dim, 0.0);
             Some(pooled)
         }
+    }
+
+    /// Batch encode: tokenize semua teks, pad ke max_seq_len, sekali model.run().
+    /// Mengembalikan Vec embedding (L2-normalized, dim-dim).
+    fn embed_batch_static(model: &mut Session, tokenizer: &tokenizers::Tokenizer, texts: &[String], dim: usize) -> Vec<Vec<f32>> {
+        if texts.is_empty() { return Vec::new(); }
+        let encodings = match tokenizer.encode_batch(texts.to_vec(), true) {
+            Ok(enc) => enc,
+            Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect(),
+        };
+        let n = encodings.len();
+        let max_seq = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(1).max(1);
+
+        // Build batched arrays [n, max_seq]
+        let mut ids_flat: Vec<i64> = Vec::with_capacity(n * max_seq);
+        let mut mask_flat: Vec<i64> = Vec::with_capacity(n * max_seq);
+        let ttype_flat: Vec<i64> = vec![0i64; n * max_seq];
+
+        for enc in &encodings {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let seq = ids.len();
+            for &id in ids { ids_flat.push(id as i64); }
+            for &m in mask { mask_flat.push(m as i64); }
+            // padding sisa max_seq - seq sudah 0 dari vec init
+            ids_flat.resize(ids_flat.len() + (max_seq - seq), 0);
+            mask_flat.resize(mask_flat.len() + (max_seq - seq), 0);
+        }
+
+        // Simpan salinan mask sebelum array consume
+        let mask_for_pool: Vec<i64> = mask_flat.clone();
+
+        let ids_arr = Array2::from_shape_vec((n, max_seq), ids_flat).unwrap();
+        let mask_arr = Array2::from_shape_vec((n, max_seq), mask_flat).unwrap();
+        let ttype_arr = Array2::from_shape_vec((n, max_seq), ttype_flat).unwrap();
+
+        let ids_val = match Value::from_array(ids_arr.into_dyn()) { Ok(v) => v, Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect() };
+        let mask_val = match Value::from_array(mask_arr.into_dyn()) { Ok(v) => v, Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect() };
+        let ttype_val = match Value::from_array(ttype_arr.into_dyn()) { Ok(v) => v, Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect() };
+
+        let outputs = match model.run(ort::inputs![
+            "input_ids" => ids_val,
+            "attention_mask" => mask_val,
+            "token_type_ids" => ttype_val
+        ]) {
+            Ok(o) => o,
+            Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect(),
+        };
+
+        let (shape, data) = match outputs[0].try_extract_tensor::<f32>() {
+            Ok(v) => v,
+            Err(_) => return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect(),
+        };
+        let shape: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+        if shape.len() != 3 || shape[0] != n {
+            return texts.iter().map(|t| Self::embed_hash_static(t, dim)).collect();
+        }
+        let hidden = shape[2];
+
+        let mut results: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let seq = encodings[i].get_ids().len();
+            let mask_f: Vec<f32> = mask_for_pool[i*max_seq..(i+1)*max_seq].iter().map(|&x| x as f32).collect();
+            let mask_sum: f32 = mask_f.iter().sum::<f32>().max(1.0);
+            let mut pooled = vec![0.0f32; hidden];
+            for t in 0..seq {
+                let m = mask_f[t];
+                if m == 0.0 { continue; }
+                let base = i * max_seq * hidden + t * hidden;
+                for h in 0..hidden {
+                    pooled[h] += data[base + h] * m;
+                }
+            }
+            for v in &mut pooled { *v /= mask_sum; }
+            let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 { for v in &mut pooled { *v /= norm; } }
+            if pooled.len() > dim { pooled.truncate(dim); }
+            else if pooled.len() < dim { pooled.resize(dim, 0.0); }
+            results.push(pooled);
+        }
+        results
+    }
+
+    fn embed_hash_static(text: &str, dim: usize) -> Vec<f32> {
+        let mut emb = vec![0.0f32; dim];
+        for_each_gram_idx(text, dim, |idx| { emb[idx] += 1.0; });
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 { for v in &mut emb { *v /= norm; } }
+        emb
     }
     
     fn embed_hash(&self, text: &str) -> Vec<f32> {
@@ -441,17 +532,43 @@ impl OnodIndex {
         Self { docs: Vec::new(), dense_index: Vec::new(), sparse_index: Vec::new(), dim_df: vec![0u32; dim] }
     }
 
+    #[allow(dead_code)]
     fn add_text(&mut self, text: &str, source: &str, page: u32, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, progress: Option<&dyn Fn(usize, usize)>) -> u32 {
         let norm = normalize(text);
         let cfg = get_config();
         if norm.len() < cfg.min_chunk { return 0; }
-        let chunks = chunk_text(&norm);
-        let total = chunks.len();
+        let all_chunks = chunk_text(&norm);
+        // Filter valid chunks, collect (content, heading) pairs
+        let mut valid: Vec<(String, String)> = Vec::new();
+        for (content, heading) in all_chunks {
+            if content.len() >= cfg.min_chunk {
+                valid.push((content, heading));
+            }
+        }
+        if valid.is_empty() { return 0; }
+        let total = valid.len();
+
+        // Batch dense embedding — satu Session::run() untuk semua chunk
+        let texts: Vec<String> = valid.iter().map(|(c, _)| c.clone()).collect();
+        let dense_embeddings: Vec<Vec<f32>> = if embedder.has_model() {
+            if let Ok(mut guard) = embedder.model.lock() {
+                    if let Some(ref mut model) = *guard {
+                        TransformerEmbedder::embed_batch_static(model, &embedder.tokenizer, &texts, embedder.dim)
+                } else {
+                    texts.iter().map(|t| embedder.embed(t)).collect()
+                }
+            } else {
+                texts.iter().map(|t| embedder.embed(t)).collect()
+            }
+        } else {
+            texts.iter().map(|t| embedder.embed(t)).collect()
+        };
+
         let mut n = 0u32;
-        for (ci, (content, heading)) in chunks.into_iter().enumerate() {
-            if content.len() < cfg.min_chunk { continue; }
+        for ci in 0..total {
+            let (content, heading) = valid[ci].clone();
+            let dense_embedding = dense_embeddings[ci].clone();
             if let Some(cb) = progress { cb(ci + 1, total); }
-            let dense_embedding = embedder.embed(&content);
             for (i, v) in dense_embedding.iter().enumerate() {
                 if *v > 0.0 {
                     if i >= self.dim_df.len() { self.dim_df.resize(i + 1, 0); }
@@ -465,6 +582,68 @@ impl OnodIndex {
             n += 1;
         }
         n
+    }
+
+    /// Build index seluruh file dalam satu batch Session::run().
+    /// 3750 chunks -> 1 inference call (dibagi batch 256 untuk memory).
+    fn build_index_batch(&mut self, file_texts: &[(String, String)], embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, progress: Option<&dyn Fn(usize, usize)>) {
+        let cfg = get_config();
+        let mut all_chunks: Vec<(String, String, String)> = Vec::new(); // (content, heading, source)
+
+        // 1. Chunk semua file
+        for (name, text) in file_texts {
+            let norm = normalize(text);
+            if norm.len() < cfg.min_chunk { continue; }
+            for (content, heading) in chunk_text(&norm) {
+                if content.len() >= cfg.min_chunk {
+                    all_chunks.push((content, heading, name.clone()));
+                }
+            }
+        }
+        let total = all_chunks.len();
+        if total == 0 { return; }
+
+        // 2. Batch embed semua chunks sekaligus (dibagi batch 256 untuk memory)
+        let batch_size = 256;
+        let mut all_dense: Vec<Vec<f32>> = Vec::with_capacity(total);
+        let has_model = embedder.has_model();
+
+        if has_model {
+            if let Ok(mut guard) = embedder.model.lock() {
+                if let Some(ref mut model) = *guard {
+                    for batch_start in (0..total).step_by(batch_size) {
+                        let batch_end = (batch_start + batch_size).min(total);
+                        if let Some(cb) = progress { cb(batch_start + 1, total); }
+                        let texts: Vec<String> = all_chunks[batch_start..batch_end].iter().map(|(c, _, _)| c.clone()).collect();
+                        let embeddings = TransformerEmbedder::embed_batch_static(model, &embedder.tokenizer, &texts, embedder.dim);
+                        all_dense.extend(embeddings);
+                    }
+                } else {
+                    all_dense = all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect();
+                }
+            } else {
+                all_dense = all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect();
+            }
+        } else {
+            all_dense = all_chunks.iter().map(|(c, _, _)| embedder.embed(c)).collect();
+        }
+
+        // 3. Build index dari embeddings
+        for ci in 0..total {
+            let (content, heading, source) = all_chunks[ci].clone();
+            let dense_embedding = all_dense[ci].clone();
+            if let Some(cb) = progress { cb(ci + 1, total); }
+            for (i, v) in dense_embedding.iter().enumerate() {
+                if *v > 0.0 {
+                    if i >= self.dim_df.len() { self.dim_df.resize(i + 1, 0); }
+                    self.dim_df[i] += 1;
+                }
+            }
+            let sparse_embedding = sparse_embedder.embed(&content);
+            self.docs.push(Doc { content, source, page: 0, heading, dense_embedding: dense_embedding.clone(), sparse_embedding: sparse_embedding.clone() });
+            self.dense_index.push(dense_embedding);
+            self.sparse_index.push(sparse_embedding);
+        }
     }
 
     fn search(&self, query: &str, embedder: &TransformerEmbedder, sparse_embedder: &SparseEmbedder, reranker: &Reranker, top_k: usize) -> Vec<SearchResult> {
@@ -684,36 +863,42 @@ fn main() {
     match args[1].as_str() {
         "benchmark" => {
             let folder = args.get(2).expect("provide folder");
+            let reindex = args.iter().any(|a| a == "--reindex");
             let mut idx = OnodIndex::new();
             let mut sparse = SparseEmbedder::new();
-            
-            // First pass: collect texts for vocab building
             let t0 = Instant::now();
-            let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
-            
-            let results = read_files_parallel(&paths);
-            let texts: Vec<String> = results.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
-            
-            // Build sparse vocab
-            sparse.build_vocab(&texts);
-            
-            // Index all documents
-            for (path, result) in &results {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                if let Ok(text) = result {
-                    if !text.is_empty() {
-                        let name_c = name.clone();
-                        let c = idx.add_text(&text, &name, 0, &embedder, &sparse, Some(&|cur, tot| {
-                            if cur == 1 || cur == tot || cur % 50 == 0 {
-                                eprint!("\r  {} [{}/{}]", name_c, cur, tot);
-                                if cur == tot { eprintln!(); }
-                            }
-                        }));
-                        if c > 0 { eprintln!("  {} -> {} chunks", name, c); }
-                    }
+            let index_path = Path::new(folder).join("index.bin");
+
+            // Load index jika sudah ada dan tidak --reindex
+            if index_path.exists() && !reindex {
+                eprintln!("Loading cached index...");
+                match OnodIndex::load(&index_path) {
+                    Ok(loaded) => { idx = loaded; eprintln!("  {} chunks loaded in {:.2}s", idx.docs.len(), t0.elapsed().as_secs_f64()); }
+                    Err(e) => { eprintln!("  stale index ({}), rebuilding...", e); let _ = std::fs::remove_file(&index_path); }
                 }
             }
-            eprintln!("\nIndex: {} chunks, {:.2}s\n", idx.docs.len(), t0.elapsed().as_secs_f64());
+
+            if idx.docs.is_empty() {
+                let t_index = Instant::now();
+                let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+                let results = read_files_parallel(&paths);
+                let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+                }).collect();
+                let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+                sparse.build_vocab(&texts);
+
+                eprintln!("Batch embedding {} files...", file_texts.len());
+                idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
+                    if cur == 1 || cur == tot || cur % 100 == 0 {
+                        eprint!("\r  Embedding [{}/{}]", cur, tot);
+                        if cur == tot { eprintln!(); }
+                    }
+                }));
+                eprintln!("Index: {} chunks, {:.2}s (build: {:.2}s)\n", idx.docs.len(), t_index.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64());
+                let _ = idx.save(&index_path);
+            }
             
             // 20 Complex Test Queries
             let queries = vec![
@@ -769,9 +954,19 @@ fn main() {
                 eprintln!("Building index...");
                 let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
                 let results = read_files_parallel(&paths);
-                let texts: Vec<String> = results.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
+                let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+                }).collect();
+                let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
                 sparse.build_vocab(&texts);
-                for (path, result) in &results { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0, &embedder, &sparse, Some(&|cur, tot| { if cur == 1 || cur == tot || cur % 50 == 0 { eprint!("\r  {} [{}/{}]", name, cur, tot); if cur == tot { eprintln!(); } } })); } }
+                idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
+                    if cur == 1 || cur == tot || cur % 100 == 0 {
+                        eprint!("\r  Embedding [{}/{}]", cur, tot);
+                        if cur == tot { eprintln!(); }
+                    }
+                }));
+                eprintln!("Index: {} chunks", idx.docs.len());
                 let _ = idx.save(&index_path);
             }
             let t1 = Instant::now(); let results = idx.search(&query, &embedder, &sparse, &reranker, 10); let ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -781,11 +976,35 @@ fn main() {
         "serve" => {
             let folder = args.get(2).expect("provide folder"); let port: u16 = args.iter().position(|a| a == "--port").and_then(|i| args.get(i+1)).and_then(|p| p.parse().ok()).unwrap_or(8080);
             let mut idx = OnodIndex::new(); let mut sparse = SparseEmbedder::new();
-            eprintln!("Building index..."); let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
-            let results = read_files_parallel(&paths); let texts: Vec<String> = results.iter().filter_map(|(_, r)| r.as_ref().ok().cloned()).collect();
-            sparse.build_vocab(&texts);
-            for (path, result) in &results { let name = path.file_name().unwrap_or_default().to_string_lossy().to_string(); if let Ok(text) = result { idx.add_text(&text, &name, 0, &embedder, &sparse, Some(&|cur, tot| { if cur == 1 || cur == tot || cur % 50 == 0 { eprint!("\r  {} [{}/{}]", name, cur, tot); if cur == tot { eprintln!(); } } })); } }
-            eprintln!("Index: {} chunks", idx.docs.len());
+            let index_path = Path::new(folder).join("index.bin");
+
+            // Load index jika sudah ada
+            if index_path.exists() {
+                eprintln!("Loading cached index...");
+                match OnodIndex::load(&index_path) {
+                    Ok(loaded) => { idx = loaded; eprintln!("  {} chunks loaded", idx.docs.len()); }
+                    Err(e) => { eprintln!("  stale index ({}), rebuilding...", e); let _ = std::fs::remove_file(&index_path); }
+                }
+            }
+
+            if idx.docs.is_empty() {
+                eprintln!("Building index..."); let paths: Vec<PathBuf> = fs::read_dir(folder).expect("cannot read dir").filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_indexable(p)).collect();
+                let results = read_files_parallel(&paths);
+                let file_texts: Vec<(String, String)> = results.iter().filter_map(|(p, r)| {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    r.as_ref().ok().filter(|t| !t.is_empty()).map(|t| (name, t.clone()))
+                }).collect();
+                let texts: Vec<String> = file_texts.iter().map(|(_, t)| t.clone()).collect();
+                sparse.build_vocab(&texts);
+                idx.build_index_batch(&file_texts, &embedder, &sparse, Some(&|cur, tot| {
+                    if cur == 1 || cur == tot || cur % 100 == 0 {
+                        eprint!("\r  Embedding [{}/{}]", cur, tot);
+                        if cur == tot { eprintln!(); }
+                    }
+                }));
+                eprintln!("Index: {} chunks", idx.docs.len());
+                let _ = idx.save(&index_path);
+            }
             let idx = Arc::new(idx);
             let sparse = Arc::new(sparse);
             start_server(idx, embedder, sparse, reranker, port);
